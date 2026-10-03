@@ -35,7 +35,7 @@ Need pnpm "corepack enable pnpm を実行するか、npm i -g pnpm で導入し�
 
 $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 $BuildPath = Join-Path $RepoRoot $BuildDir
-$PluginSrc = Join-Path $RepoRoot "src\plugins\vesktopChatExporter"
+$PluginsRoot = Join-Path $RepoRoot "src\plugins"
 $Out = Join-Path $RepoRoot $OutputDir
 
 Write-Host "[*] Vencord を取得: $VencordRef" -ForegroundColor Cyan
@@ -46,11 +46,15 @@ if (-not (Test-Path (Join-Path $BuildPath ".git"))) {
     git -C $BuildPath checkout $VencordRef
 }
 
-$UserPluginDir = Join-Path $BuildPath "src\userplugins\vesktopChatExporter"
-Write-Host "[*] プラグインを配置: $UserPluginDir" -ForegroundColor Cyan
-New-Item -ItemType Directory -Force -Path $UserPluginDir | Out-Null
-Copy-Item -Force (Join-Path $PluginSrc "index.tsx") $UserPluginDir
-Copy-Item -Force (Join-Path $PluginSrc "native.ts") $UserPluginDir
+$UserPluginsRoot = Join-Path $BuildPath "src\userplugins"
+New-Item -ItemType Directory -Force -Path $UserPluginsRoot | Out-Null
+Write-Host "[*] プラグインを配置" -ForegroundColor Cyan
+Get-ChildItem -Directory $PluginsRoot | ForEach-Object {
+    $dest = Join-Path $UserPluginsRoot $_.Name
+    if (Test-Path $dest) { Remove-Item -Recurse -Force $dest }
+    Copy-Item -Recurse -Force $_.FullName $dest
+    Write-Host "    - $($_.Name)"
+}
 
 Write-Host "[*] 依存関係を導入" -ForegroundColor Cyan
 Push-Location $BuildPath

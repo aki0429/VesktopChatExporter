@@ -1,6 +1,17 @@
-# Vesktop Chat Exporter
+# Vesktop Plugins
 
-Vesktop（Vencord）用のユーザープラグインです。Vesktop起動中に受信したサーバーメッセージを専用フォルダーへ自動保存します。また、サーバーメニューから**現在のアカウントが閲覧できるテキストチャンネル**の過去ログを一括取得できます。
+Vesktop（Vencord）用のユーザープラグイン集です。配布パッケージには以下のプラグインが含まれます。
+
+| プラグイン | 内容 |
+|---|---|
+| **VesktopChatExporter** | サーバーのテキストチャンネル・DMのログをTXT/HTMLへ書き出し |
+| **VesktopStreamQuality** | 画面共有（Go Live）とWebカメラの解像度・FPS・ビットレートを指定 |
+
+---
+
+## VesktopChatExporter
+
+Vesktop起動中に受信したサーバーメッセージを専用フォルダーへ自動保存します。また、サーバーメニューから**現在のアカウントが閲覧できるテキストチャンネル**の過去ログを一括取得できます。
 
 **DM・グループDMにも対応**しています。受信したDMの自動保存、DM履歴の自動収集、DM右クリックからの一括保存ができます（設定でオフにもできます）。
 
@@ -30,15 +41,15 @@ C:\Users\<ユーザー名>\Documents\VesktopChatLogs
 
 ### かんたんインストール（Releases・推奨）
 
-[Releases](../../releases) から `VesktopChatExporter.zip` をダウンロードし、展開して `install.bat` をダブルクリックします。
+[Releases](../../releases) から `VesktopPlugins.zip` をダウンロードし、展開して `install.bat` をダブルクリックします。
 
 ```text
-VesktopChatExporter.zip
+VesktopPlugins.zip
 ├── install.bat        ← ダブルクリック
 ├── install.ps1
 ├── uninstall.ps1
 ├── README.txt
-└── vencordFiles/      ← VesktopChatExporter 入りの Vencord ビルド
+└── vencordFiles/      ← 各プラグイン入りの Vencord ビルド
 ```
 
 インストーラーは以下を行います。
@@ -47,7 +58,7 @@ VesktopChatExporter.zip
 2. 既存の Vencord ファイルを `vencordFiles.bak-<日時>` へバックアップ
 3. 同梱の Vencord ビルドを `sessionData\vencordFiles` へコピー
 
-その後 **Vesktop を完全に終了して起動し直し**、`設定 → Vencord → Plugins` で `VesktopChatExporter` を有効化します。
+その後 **Vesktop を完全に終了して起動し直し**、`設定 → Vencord → Plugins` で使いたいプラグインを有効化します。
 
 元に戻すときは `uninstall.ps1` を実行します（バックアップから復元、無ければ公式 Vencord を再取得）。
 
@@ -138,3 +149,44 @@ IDは17〜20桁の数字で、カンマ・改行・空白のいずれでも区�
 ## License
 
 GPL-3.0-or-later
+
+---
+
+# VesktopStreamQuality
+
+画面共有（Go Live）とWebカメラの画質を指定するプラグインです。Discord本体のメディア品質設定を直接上書きします。
+
+## 設定できる項目
+
+### 画面共有（Go Live）
+
+- **画面共有の画質を指定する**（オン/オフ）
+- **解像度**：720p / 1080p（既定）/ 1440p / 2160p
+- **フレームレート**：30 / 60（既定）/ 120 fps
+- **最大ビットレート**：4 / 8（既定）/ 12 / 20 Mbps
+
+### Webカメラ
+
+- **Webカメラの画質を改善する**（オン/オフ）
+- **解像度**：720p / 1080p（既定）/ 1440p
+- **フレームレート**：30（既定）/ 60 fps
+- **最大ビットレート**：2.5 / 4（既定）/ 8 Mbps
+
+カメラ設定を変更したあとは、設定内の **「Webカメラ設定を今すぐ反映」** を押してください（次に通話へ入るときに適用されます）。画面共有の設定は次に配信を開始したときから適用されます。
+
+## 仕組み
+
+Discordのクライアント内モジュールに以下のパッチを当てています。
+
+- `getDefaultGoliveQuality()` を包んで、画面共有の capture / encode / ビットレートを固定
+- メディア品質の共有オプションオブジェクト（`videoBudget` / `videoCapture` / `videoBitrate`）を差し替え
+- Webカメラの `getUserMedia` 制約に `ideal` の解像度・FPSを追加
+
+Discordクライアントの内部構造に依存するため、Discordの更新で動かなくなる可能性があります。
+
+## 注意
+
+- 相手（受信側）の画面共有画質を強制的に上げるものではありません。相手が配信している品質は送信側とDiscordのネゴシエーションで決まります。
+- Webカメラが指定解像度・FPSに対応していない場合は、ブラウザが利用可能な値へ自動的にフォールバックします。
+- ビットレートを上げすぎると回線やCPU負荷が増えます。
+- Discord / Vencord の非公式改造です。自己責任で使用してください。

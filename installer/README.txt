@@ -1,15 +1,20 @@
-Vesktop Chat Exporter - インストール手順
-========================================
+Vesktop Plugins - インストール手順
+====================================
 
+このパッケージには以下のプラグインが入っています。
+
+  - VesktopChatExporter : サーバー/DMのログをTXT+HTMLへ書き出し
+  - VesktopStreamQuality : 画面共有とWebカメラの解像度・FPS・ビットレートを指定
+
+手順:
 1. このフォルダーごと、任意の場所へ展開します。
 2. install.bat をダブルクリックします。
    （PowerShell から実行する場合）
    powershell -ExecutionPolicy Bypass -File install.ps1
 3. Vesktop を完全に終了し、起動し直します。
-4. 設定 -> Vencord -> Plugins -> VesktopChatExporter を有効化します。
-5. サーバーを右クリック -> 「全チャンネルのログを保存（TXT + HTML）」
+4. 設定 -> Vencord -> Plugins -> VesktopChatExporter / VesktopStreamQuality を有効化します。
 
-ログの保存先:
+ログの保存先（VesktopChatExporter）:
   C:\Users\<ユーザー名>\Documents\VesktopChatLogs
 
 アンインストール:

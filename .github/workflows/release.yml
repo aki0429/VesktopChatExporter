@@ -30,11 +30,10 @@ jobs:
           ref: ${{ env.VENCORD_REF }}
           path: .build-vencord
 
-      - name: Put plugin into Vencord
+      - name: Put plugins into Vencord
         run: |
-          mkdir -p .build-vencord/src/userplugins/vesktopChatExporter
-          cp src/plugins/vesktopChatExporter/index.tsx .build-vencord/src/userplugins/vesktopChatExporter/
-          cp src/plugins/vesktopChatExporter/native.ts .build-vencord/src/userplugins/vesktopChatExporter/
+          mkdir -p .build-vencord/src/userplugins
+          cp -r src/plugins/* .build-vencord/src/userplugins/
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -59,7 +58,7 @@ jobs:
       - name: Assemble release package
         run: |
           set -e
-          NAME="VesktopChatExporter"
+          NAME="VesktopPlugins"
           OUT="release"
           rm -rf "$OUT"
           mkdir -p "$OUT/vencordFiles"
@@ -86,4 +85,4 @@ jobs:
           tag_name: ${{ github.event.inputs.version || github.ref_name }}
           name: Vesktop Chat Exporter ${{ github.event.inputs.version || github.ref_name }}
           generate_release_notes: true
-          files: VesktopChatExporter.zip
+          files: VesktopPlugins.zip
