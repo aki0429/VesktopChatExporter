@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag (example: v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  VENCORD_REF: v1.15.9
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v4
+
+      - name: Checkout Vencord
+        uses: actions/checkout@v4
+        with:
+          repository: Vendicated/Vencord
+          ref: ${{ env.VENCORD_REF }}
+          path: .build-vencord
+
+      - name: Put plugin into Vencord
+        run: |
+          mkdir -p .build-vencord/src/userplugins/vesktopChatExporter
+          cp src/plugins/vesktopChatExporter/index.tsx .build-vencord/src/userplugins/vesktopChatExporter/
+          cp src/plugins/vesktopChatExporter/native.ts .build-vencord/src/userplugins/vesktopChatExporter/
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: .build-vencord/pnpm-lock.yaml
+
+      - name: Install dependencies
+        working-directory: .build-vencord
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Vencord + plugin
+        working-directory: .build-vencord
+        run: pnpm build
+
+      - name: Assemble release package
+        run: |
+          set -e
+          NAME="VesktopChatExporter"
+          OUT="release"
+          rm -rf "$OUT"
+          mkdir -p "$OUT/vencordFiles"
+          cp .build-vencord/dist/vencordDesktopMain.js     "$OUT/vencordFiles/"
+          cp .build-vencord/dist/vencordDesktopPreload.js  "$OUT/vencordFiles/"
+          cp .build-vencord/dist/vencordDesktopRenderer.js "$OUT/vencordFiles/"
+          cp .build-vencord/dist/vencordDesktopRenderer.css "$OUT/vencordFiles/"
+          printf '{}' > "$OUT/vencordFiles/package.json"
+          cp installer/install.ps1 installer/uninstall.ps1 installer/install.bat installer/README.txt "$OUT/"
+          cp LICENSE "$OUT/LICENSE"
+          {
+            echo "Vesktop Chat Exporter"
+            echo "Vencord build: $VENCORD_REF (GPL-3.0-or-later) - https://github.com/Vendicated/Vencord"
+            echo "Plugin source: https://github.com/${{ github.repository }}"
+          } > "$OUT/NOTICE.txt"
+          cd "$OUT"
+          zip -r "../${NAME}.zip" .
+          cd ..
+          ls -la "${NAME}.zip"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.version || github.ref_name }}
+          name: Vesktop Chat Exporter ${{ github.event.inputs.version || github.ref_name }}
+          generate_release_notes: true
+          files: VesktopChatExporter.zip

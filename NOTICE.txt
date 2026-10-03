@@ -1,0 +1,13 @@
+Vesktop Chat Exporter
+=====================
+
+本パッケージは Vesktop（Vencord）用ユーザープラグイン VesktopChatExporter を
+組み込んだ Vencord ビルドを同梱しています。
+
+- Vencord: https://github.com/Vendicated/Vencord （GPL-3.0-or-later）
+- 同梱 Vencord ビルドの元リビジョン: v1.15.9
+- プラグインのソースおよび対応するソースコード:
+  https://github.com/aki0429/VesktopChatExporter
+
+同梱の vencordFiles は GPL-3.0-or-later の下で配布されます。
+完全なライセンス全文は同梱の LICENSE を参照してください。
