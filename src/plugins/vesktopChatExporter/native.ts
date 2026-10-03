@@ -13,13 +13,20 @@ function safeFileName(value: string) {
     return value.replace(/[\\/:*?"<>|]/g, "_").replace(/[. ]+$/g, "").slice(0, 180) || "chat-export";
 }
 
+// Records for guilds go directly under the log folder; DMs live in a "DMs" subfolder.
+function rootDir(category?: string) {
+    const root = join(app.getPath("documents"), LOG_FOLDER);
+    return category ? join(root, safeFileName(category)) : root;
+}
+
 export async function saveLogs(
     _: IpcMainInvokeEvent,
+    category: string | undefined,
     baseName: string,
     txt: string,
     html: string
 ) {
-    const directory = join(app.getPath("documents"), LOG_FOLDER);
+    const directory = rootDir(category);
     await mkdir(directory, { recursive: true });
 
     const safeBase = safeFileName(baseName);
@@ -34,6 +41,7 @@ export async function saveLogs(
 }
 
 type LiveMessage = {
+    category?: string;
     guildId: string;
     guildName: string;
     channelId: string;
@@ -54,8 +62,8 @@ export async function appendLiveMessage(_: IpcMainInvokeEvent, message: LiveMess
     if (!/^\d{17,20}$/.test(message.guildId) || !/^\d{17,20}$/.test(message.channelId)) throw new Error("Invalid Discord ID");
 
     const day = new Date(message.timestamp).toISOString().slice(0, 10);
-    const guildFolder = `${safeFileName(message.guildName)}_${message.guildId}`;
-    const directory = join(app.getPath("documents"), LOG_FOLDER, guildFolder);
+    const containerFolder = `${safeFileName(message.guildName)}_${message.guildId}`;
+    const directory = join(rootDir(message.category), containerFolder);
     await mkdir(directory, { recursive: true });
     const base = `${day}_${safeFileName(message.channelName)}_${message.channelId}`;
     const txtPath = join(directory, `${base}.txt`);
@@ -95,6 +103,7 @@ export async function saveCrawlState(_: IpcMainInvokeEvent, state: CrawlState) {
 
 export async function saveHistoryPage(
     _: IpcMainInvokeEvent,
+    category: string | undefined,
     guildId: string,
     guildName: string,
     channelId: string,
@@ -102,7 +111,7 @@ export async function saveHistoryPage(
     messages: HistoryMessage[]
 ) {
     if (!/^\d{17,20}$/.test(guildId) || !/^\d{17,20}$/.test(channelId) || !messages.length) return null;
-    const directory = join(app.getPath("documents"), LOG_FOLDER, `${safeFileName(guildName)}_${guildId}`, "History", `${safeFileName(channelName)}_${channelId}`);
+    const directory = join(rootDir(category), `${safeFileName(guildName)}_${guildId}`, "History", `${safeFileName(channelName)}_${channelId}`);
     await mkdir(directory, { recursive: true });
 
     // A page is named by its newest/oldest snowflakes. Re-fetching the same page

@@ -26,6 +26,9 @@ import {
 
 const Native = VencordNative.pluginHelpers.VesktopChatExporter as PluginNative<typeof import("./native")>;
 
+const DM_CATEGORY = "DMs";
+const DM_CHANNEL_TYPES = [1, 3]; // 1 = DM, 3 = GROUP_DM
+
 const settings = definePluginSettings({
     includeAttachments: {
         description: "添付ファイルと埋め込みのURLを出力する",
@@ -42,8 +45,18 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         default: true
     },
+    saveDmMessages: {
+        description: "受信したDM・グループDMを専用フォルダーへ自動追記する",
+        type: OptionType.BOOLEAN,
+        default: true
+    },
     forceHistoryCrawl: {
         description: "起動中、全サーバーの閲覧可能な履歴を最新から古い順に低速で自動収集する",
+        type: OptionType.BOOLEAN,
+        default: true
+    },
+    crawlDms: {
+        description: "履歴の自動収集・一括保存にDM・グループDMを含める",
         type: OptionType.BOOLEAN,
         default: true
     },
@@ -53,7 +66,7 @@ const settings = definePluginSettings({
         default: ""
     },
     blockedChannelIds: {
-        description: "ログ収集を停止するチャンネルID（カンマ・改行・空白区切り）",
+        description: "ログ収集を停止するチャンネル／DMのID（カンマ・改行・空白区切り）",
         type: OptionType.STRING,
         default: ""
     },
@@ -86,6 +99,42 @@ function toggleBlockedId(key: "blockedGuildIds" | "blockedChannelIds", id: strin
     return next.includes(id);
 }
 
+function isDmChannel(channel?: { type?: number; } | null): boolean {
+    return !!channel && DM_CHANNEL_TYPES.includes(channel.type as number);
+}
+
+function recipientName(user: any): string {
+    return user?.global_name || user?.display_name || user?.username || user?.id || "unknown";
+}
+
+// Human readable label for any channel: guild channel name, DM partner, or group DM name.
+function channelLabel(channel: any): string {
+    if (!isDmChannel(channel)) return channel?.name ?? channel?.id ?? "unknown";
+    if (channel.type === 3) {
+        if (channel.name) return channel.name;
+        const names = (channel.rawRecipients ?? []).map(recipientName).filter(Boolean);
+        return names.length ? names.join(", ") : "Group DM";
+    }
+    const other = (channel.rawRecipients ?? [])[0];
+    return other ? recipientName(other) : "DM";
+}
+
+function getDmChannels(): Channel[] {
+    const store = ChannelStore as any;
+    let list: any[] = [];
+    try {
+        list = store.getSortedPrivateChannels?.() ?? [];
+    } catch { /* store not ready yet */ }
+    if (!list.length) {
+        try {
+            list = Object.values(store.getMutablePrivateChannels?.() ?? {});
+        } catch { /* ignore */ }
+    }
+    return list
+        .filter((channel: any) => isDmChannel(channel) && !isLoggingBlocked(undefined, channel.id))
+        .sort((a: any, b: any) => String(channelLabel(a)).localeCompare(String(channelLabel(b)), "ja"));
+}
+
 function BlocklistSettings() {
     const s = settings.use(["blockedGuildIds", "blockedChannelIds"]);
     const guilds = parseIdList(s.blockedGuildIds);
@@ -99,7 +148,7 @@ function BlocklistSettings() {
     };
     return <div style={{ display: "grid", gap: "10px", marginTop: "6px" }}>
         <Forms.FormText>
-            ここに追加したサーバー／チャンネルでは、自動保存・履歴収集・一括保存・通話録画を行いません（Vesktop Consent Recorder と共通）。
+            ここに追加したサーバー／チャンネル／DMでは、自動保存・履歴収集・一括保存・通話録画を行いません（Vesktop Consent Recorder と共通）。
         </Forms.FormText>
         <div style={{ display: "grid", gap: "4px" }}>
             <b>停止するサーバーID（{guilds.length}件）</b>
@@ -116,7 +165,7 @@ function BlocklistSettings() {
             </button>
         </div>
         <div style={{ display: "grid", gap: "4px" }}>
-            <b>停止するチャンネルID（{channels.length}件）</b>
+            <b>停止するチャンネル／DMのID（{channels.length}件）</b>
             <textarea
                 value={s.blockedChannelIds ?? ""}
                 onChange={e => { (settings.store as any).blockedChannelIds = e.target.value; }}
@@ -126,7 +175,7 @@ function BlocklistSettings() {
                 style={{ width: "100%", resize: "vertical", fontFamily: "monospace" }}
             />
             <button type="button" disabled={!selectedChannel} onClick={() => toggle("blockedChannelIds", selectedChannel)}>
-                {selectedChannel && channels.includes(selectedChannel) ? "現在のチャンネルのログ収集を再開" : "現在のチャンネルのログ収集を停止"}
+                {selectedChannel && channels.includes(selectedChannel) ? "現在のチャンネル／DMのログ収集を再開" : "現在のチャンネル／DMのログ収集を停止"}
             </button>
         </div>
     </div>;
@@ -145,6 +194,9 @@ type RawMessage = {
     poll?: any;
     referenced_message?: RawMessage | null;
 };
+
+// A crawl/export target: either a guild (all viewable text channels) or a single DM.
+type Container = { category?: string; id: string; name: string; channels: Channel[]; };
 
 type ExportChannel = { channel: Channel; messages: RawMessage[]; error?: string; };
 let exporting = false;
@@ -237,12 +289,12 @@ async function pacedGet(channelId: string, before?: string) {
     }
 }
 
-function toHistoryMessage(message: RawMessage, guild: Guild, channel: Channel) {
+function toHistoryMessage(message: RawMessage, container: Container, channel: Channel) {
     return {
-        guildId: guild.id,
-        guildName: guild.name,
+        guildId: container.id,
+        guildName: container.name,
         channelId: channel.id,
-        channelName: (channel as any).name ?? channel.id,
+        channelName: channelLabel(channel),
         messageId: message.id,
         timestamp: message.timestamp || new Date().toISOString(),
         author: message.author?.global_name || message.author?.username || "Unknown",
@@ -252,24 +304,40 @@ function toHistoryMessage(message: RawMessage, guild: Guild, channel: Channel) {
     };
 }
 
+function buildContainers(): Container[] {
+    const containers: Container[] = [];
+
+    for (const guild of Object.values(GuildStore.getGuilds()) as Guild[]) {
+        if (isLoggingBlocked(guild.id)) continue;
+        const channels = getExportableChannels(guild.id);
+        if (channels.length) containers.push({ id: guild.id, name: guild.name, channels });
+    }
+
+    if (settings.store.crawlDms) {
+        for (const channel of getDmChannels()) {
+            containers.push({ category: DM_CATEGORY, id: channel.id, name: channelLabel(channel), channels: [channel] });
+        }
+    }
+
+    return containers;
+}
+
 async function crawlAllHistory() {
     if (crawlRunning || !settings.store.forceHistoryCrawl) return;
     crawlRunning = true;
     crawlStopped = false;
     try {
         const state = await Native.loadCrawlState();
-        const guilds = Object.values(GuildStore.getGuilds()) as Guild[];
-        for (const guild of guilds) {
-            if (isLoggingBlocked(guild.id)) continue;
-            for (const channel of getExportableChannels(guild.id)) {
+        for (const container of buildContainers()) {
+            for (const channel of container.channels) {
                 if (crawlStopped || !settings.store.forceHistoryCrawl) return;
-                const key = `${guild.id}:${channel.id}`;
+                const key = `${container.id}:${channel.id}`;
                 const saved = state[key] ?? {};
                 if (saved.completed) continue;
                 let before = saved.before;
                 while (!crawlStopped && settings.store.forceHistoryCrawl) {
                     // The channel may have been added to the stop list while this loop was running.
-                    if (isLoggingBlocked(guild.id, channel.id)) break;
+                    if (isLoggingBlocked(container.category ? undefined : container.id, channel.id)) break;
                     try {
                         const page = await pacedGet(channel.id, before);
                         if (!page.length) {
@@ -277,7 +345,14 @@ async function crawlAllHistory() {
                             await Native.saveCrawlState(state);
                             break;
                         }
-                        await Native.saveHistoryPage(guild.id, guild.name, channel.id, (channel as any).name ?? channel.id, page.map(message => toHistoryMessage(message, guild, channel)));
+                        await Native.saveHistoryPage(
+                            container.category,
+                            container.id,
+                            container.name,
+                            channel.id,
+                            channelLabel(channel),
+                            page.map(message => toHistoryMessage(message, container, channel))
+                        );
                         before = page[page.length - 1].id; // API is newest -> oldest.
                         state[key] = { before, completed: page.length < 100, updatedAt: new Date().toISOString() };
                         await Native.saveCrawlState(state);
@@ -340,43 +415,43 @@ function messageText(message: RawMessage): string {
     return lines.join("\n");
 }
 
-function makeTxt(guild: Guild, channels: ExportChannel[]) {
+function makeTxt(title: string, targetId: string, channels: ExportChannel[]) {
     const body = channels.map(({ channel, messages, error }) => {
-        const header = `\n\n${"=".repeat(72)}\n# ${(channel as any).name} (${channel.id})\n${"=".repeat(72)}`;
+        const header = `\n\n${"=".repeat(72)}\n# ${channelLabel(channel)} (${channel.id})\n${"=".repeat(72)}`;
         return header + (error ? `\nERROR: ${error}` : `\n${messages.map(messageText).join("\n\n")}`);
     }).join("");
-    return `Discord server chat export\nServer: ${guild.name}\nServer ID: ${guild.id}\nExported: ${new Date().toISOString()}\nChannels: ${channels.length}\nMessages: ${channels.reduce((n, c) => n + c.messages.length, 0)}${body}\n`;
+    return `Discord chat export\nTarget: ${title}\nTarget ID: ${targetId}\nExported: ${new Date().toISOString()}\nChannels: ${channels.length}\nMessages: ${channels.reduce((n, c) => n + c.messages.length, 0)}${body}\n`;
 }
 
-function makeHtml(guild: Guild, channels: ExportChannel[]) {
-    const sections = channels.map(({ channel, messages, error }) => `<section id="c-${channel.id}"><h2># ${escapeHtml((channel as any).name)}</h2>${error ? `<p class="error">${escapeHtml(error)}</p>` : messages.map(m => {
+function makeHtml(title: string, targetId: string, channels: ExportChannel[]) {
+    const sections = channels.map(({ channel, messages, error }) => `<section id="c-${channel.id}"><h2># ${escapeHtml(channelLabel(channel))}</h2>${error ? `<p class="error">${escapeHtml(error)}</p>` : messages.map(m => {
         const author = m.author?.global_name || m.author?.username || "Unknown";
         const attachments = settings.store.includeAttachments ? (m.attachments ?? []).map(a => `<a class="attachment" href="${escapeHtml(a.url)}" target="_blank" rel="noreferrer">📎 ${escapeHtml(a.filename)}</a>`).join("") : "";
         const embeds = settings.store.includeAttachments ? (m.embeds ?? []).filter(e => e.url).map(e => `<a class="attachment" href="${escapeHtml(e.url)}" target="_blank" rel="noreferrer">🔗 ${escapeHtml(e.title ?? e.url)}</a>`).join("") : "";
         return `<article><div class="meta"><b>${escapeHtml(author)}</b><span>${escapeHtml(m.timestamp)}</span><code>${m.id}</code></div><div class="content">${escapeHtml(richContent(m)).replace(/\n/g, "<br>")}</div>${attachments}${embeds}</article>`;
     }).join("")}</section>`).join("");
-    const nav = channels.map(c => `<a href="#c-${c.channel.id}"># ${escapeHtml((c.channel as any).name)}</a>`).join("");
-    return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHtml(guild.name)} Chat Export</title><style>*{box-sizing:border-box}body{margin:0;background:#1e1f22;color:#dbdee1;font:14px system-ui,sans-serif}.layout{display:grid;grid-template-columns:260px 1fr;min-height:100vh}aside{position:sticky;top:0;height:100vh;overflow:auto;background:#2b2d31;padding:20px}aside h1{font-size:18px}aside a{display:block;color:#b5bac1;text-decoration:none;padding:7px;border-radius:5px}aside a:hover{background:#35373c;color:#fff}main{max-width:1000px;padding:28px 40px}section{margin-bottom:55px}h2{border-bottom:1px solid #3f4147;padding-bottom:12px}article{padding:10px 12px;border-radius:5px}article:hover{background:#2b2d31}.meta{display:flex;gap:10px;align-items:baseline}.meta b{color:#fff}.meta span,.meta code{font-size:11px;color:#949ba4}.content{white-space:normal;margin-top:4px;line-height:1.5}.attachment{display:block;color:#00a8fc;margin-top:5px}.error{color:#f23f42}@media(max-width:700px){.layout{display:block}aside{position:relative;height:auto}main{padding:18px}}</style></head><body><div class="layout"><aside><h1>${escapeHtml(guild.name)}</h1><p>${channels.reduce((n,c)=>n+c.messages.length,0)} messages</p>${nav}</aside><main><h1>${escapeHtml(guild.name)} — Chat Export</h1><p>Exported: ${escapeHtml(new Date().toISOString())}</p>${sections}</main></div></body></html>`;
+    const nav = channels.map(c => `<a href="#c-${c.channel.id}"># ${escapeHtml(channelLabel(c.channel))}</a>`).join("");
+    return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHtml(title)} Chat Export</title><style>*{box-sizing:border-box}body{margin:0;background:#1e1f22;color:#dbdee1;font:14px system-ui,sans-serif}.layout{display:grid;grid-template-columns:260px 1fr;min-height:100vh}aside{position:sticky;top:0;height:100vh;overflow:auto;background:#2b2d31;padding:20px}aside h1{font-size:18px}aside a{display:block;color:#b5bac1;text-decoration:none;padding:7px;border-radius:5px}aside a:hover{background:#35373c;color:#fff}main{max-width:1000px;padding:28px 40px}section{margin-bottom:55px}h2{border-bottom:1px solid #3f4147;padding-bottom:12px}article{padding:10px 12px;border-radius:5px}article:hover{background:#2b2d31}.meta{display:flex;gap:10px;align-items:baseline}.meta b{color:#fff}.meta span,.meta code{font-size:11px;color:#949ba4}.content{white-space:normal;margin-top:4px;line-height:1.5}.attachment{display:block;color:#00a8fc;margin-top:5px}.error{color:#f23f42}@media(max-width:700px){.layout{display:block}aside{position:relative;height:auto}main{padding:18px}}</style></head><body><div class="layout"><aside><h1>${escapeHtml(title)}</h1><p>${channels.reduce((n,c)=>n+c.messages.length,0)} messages</p>${nav}</aside><main><h1>${escapeHtml(title)} — Chat Export</h1><p>Exported: ${escapeHtml(new Date().toISOString())}</p><p>Target ID: ${escapeHtml(targetId)}</p>${sections}</main></div></body></html>`;
 }
 
-async function exportGuild(guild: Guild) {
+async function exportChannels(container: Container, label: string) {
     if (exporting) return showToast("既にエクスポート中です", Toasts.Type.MESSAGE);
     exporting = true; cancelled = false;
-    const channels = getExportableChannels(guild.id);
+    const channels = container.channels;
     const output: ExportChannel[] = [];
     try {
         if (!channels.length) {
-            showToast(isLoggingBlocked(guild.id) ? `${guild.name}: このサーバーは停止リストに含まれています` : `${guild.name}: 取得できるチャンネルがありません`, Toasts.Type.FAILURE);
+            showToast(isLoggingBlocked(container.id) ? `${label}: この対象は停止リストに含まれています` : `${label}: 取得できるチャンネルがありません`, Toasts.Type.FAILURE);
             return;
         }
-        showToast(`${guild.name}: ${channels.length}チャンネルの取得を開始`, Toasts.Type.MESSAGE);
+        showToast(`${label}: ${channels.length}件の取得を開始`, Toasts.Type.MESSAGE);
         for (let i = 0; i < channels.length && !cancelled; i++) {
             const channel = channels[i];
-            const name = (channel as any).name ?? channel.id;
-            showToast(`[${i + 1}/${channels.length}] #${name} を取得中`, Toasts.Type.MESSAGE);
+            const name = channelLabel(channel);
+            showToast(`[${i + 1}/${channels.length}] ${name} を取得中`, Toasts.Type.MESSAGE);
             try {
                 const messages = await fetchAllMessages(channel, count => {
-                    if (count % 500 === 0) showToast(`#${name}: ${count}件取得`, Toasts.Type.MESSAGE);
+                    if (count % 500 === 0) showToast(`${name}: ${count}件取得`, Toasts.Type.MESSAGE);
                 });
                 output.push({ channel, messages });
             } catch (error) {
@@ -385,32 +460,58 @@ async function exportGuild(guild: Guild) {
         }
         if (cancelled) return showToast("エクスポートを中止しました", Toasts.Type.FAILURE);
         const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-        const base = `${safeName(guild.name)}_${guild.id}_${stamp}`;
-        const saved = await Native.saveLogs(base, makeTxt(guild, output), makeHtml(guild, output));
+        const base = `${safeName(label)}_${container.id}_${stamp}`;
+        const saved = await Native.saveLogs(container.category, base, makeTxt(label, container.id, output), makeHtml(label, container.id, output));
         showToast(`完了: ${output.reduce((n, c) => n + c.messages.length, 0)}件 / ${saved.directory}`, Toasts.Type.SUCCESS);
     } finally {
         exporting = false;
     }
 }
 
+function exportGuild(guild: Guild) {
+    return exportChannels({ id: guild.id, name: guild.name, channels: getExportableChannels(guild.id) }, guild.name);
+}
+
+function exportDm(channel: Channel) {
+    return exportChannels({ category: DM_CATEGORY, id: channel.id, name: channelLabel(channel), channels: [channel] }, channelLabel(channel));
+}
+
 async function saveLiveMessage(event: { message?: RawMessage & { channel_id?: string; guild_id?: string; }; }) {
-    if (!settings.store.autoSave) return;
     const message = event.message;
     if (!message?.id || savedLiveIds.has(message.id)) return;
     const channel = ChannelStore.getChannel(message.channel_id!);
-    const guildId = message.guild_id || channel?.guild_id;
+    if (!channel) return;
+    const guildId = message.guild_id || (channel as any).guild_id;
     const guild = guildId && GuildStore.getGuild(guildId);
-    if (!guild || !channel) return; // DMs are deliberately excluded.
-    if (isLoggingBlocked(guild.id, channel.id)) return; // Blocked servers/channels stay untouched.
+
+    let category: string | undefined;
+    let containerId: string;
+    let containerName: string;
+
+    if (guild) {
+        if (!settings.store.autoSave) return;
+        if (isLoggingBlocked(guild.id, channel.id)) return; // Blocked servers/channels stay untouched.
+        containerId = guild.id;
+        containerName = guild.name;
+    } else if (isDmChannel(channel)) {
+        if (!settings.store.saveDmMessages) return;
+        if (isLoggingBlocked(undefined, channel.id)) return;
+        category = DM_CATEGORY;
+        containerId = channel.id;
+        containerName = channelLabel(channel);
+    } else {
+        return; // Other private/system channels are not logged.
+    }
 
     savedLiveIds.add(message.id);
     if (savedLiveIds.size > 5000) savedLiveIds.delete(savedLiveIds.values().next().value!);
     try {
         await Native.appendLiveMessage({
-            guildId: guild.id,
-            guildName: guild.name,
+            category,
+            guildId: containerId,
+            guildName: containerName,
             channelId: channel.id,
-            channelName: (channel as any).name ?? channel.id,
+            channelName: channelLabel(channel),
             messageId: message.id,
             timestamp: message.timestamp || new Date().toISOString(),
             author: message.author?.global_name || message.author?.username || "Unknown",
@@ -439,26 +540,45 @@ const guildMenu: NavContextMenuPatchCallback = (children, { guild }: { guild?: G
 };
 
 const channelMenu: NavContextMenuPatchCallback = (children, { channel }: { channel?: Channel & { guild_id?: string; }; }) => {
-    if (!channel?.id || !channel.guild_id) return; // DMs and group chats are never logged.
+    if (!channel?.id || !channel.guild_id) return; // Guild channels only; DMs are handled below.
     const blocked = parseIdList(settings.store.blockedChannelIds).includes(channel.id);
     children.push(
         <Menu.MenuSeparator />,
         <Menu.MenuItem id="vc-toggle-channel-log" label={blocked ? "このチャンネルのログ収集を再開" : "このチャンネルのログ収集を停止"} color={blocked ? undefined : "danger"} action={() => {
             const nowBlocked = toggleBlockedId("blockedChannelIds", channel.id);
-            showToast(nowBlocked ? `#${(channel as any).name ?? channel.id}: ログ収集を停止しました` : `#${(channel as any).name ?? channel.id}: ログ収集を再開しました`, nowBlocked ? Toasts.Type.MESSAGE : Toasts.Type.SUCCESS);
+            showToast(`${nowBlocked ? "停止" : "再開"}: #${channel.name ?? channel.id}`, nowBlocked ? Toasts.Type.MESSAGE : Toasts.Type.SUCCESS);
         }} />
+    );
+};
+
+const dmMenu: NavContextMenuPatchCallback = (children, { channel }: { channel?: Channel; }) => {
+    if (!isDmChannel(channel)) return;
+    const dm = channel!;
+    const label = channelLabel(dm);
+    const blocked = parseIdList(settings.store.blockedChannelIds).includes(dm.id);
+    children.push(
+        <Menu.MenuSeparator />,
+        <Menu.MenuItem id="vc-export-dm-chat" label={`「${label}」のログを保存（TXT + HTML）`} action={() => exportDm(dm)} disabled={exporting} />,
+        <Menu.MenuItem id="vc-toggle-dm-log" label={blocked ? "このDMのログ収集を再開" : "このDMのログ収集を停止"} color={blocked ? undefined : "danger"} action={() => {
+            const nowBlocked = toggleBlockedId("blockedChannelIds", dm.id);
+            showToast(`${nowBlocked ? "停止" : "再開"}: ${label}`, nowBlocked ? Toasts.Type.MESSAGE : Toasts.Type.SUCCESS);
+        }} />,
+        <Menu.MenuItem id="vc-open-chat-log-folder-dm" label="ログ保存フォルダーを開く" action={() => Native.openLogFolder()} />,
+        exporting ? <Menu.MenuItem id="vc-cancel-dm-export" label="ログ保存を中止" color="danger" action={() => { cancelled = true; }} /> : null
     );
 };
 
 export default definePlugin({
     name: "VesktopChatExporter",
-    description: "閲覧権限のあるサーバー内テキストチャンネルをTXTとHTMLへエクスポートします",
+    description: "閲覧権限のあるサーバー内テキストチャンネルとDMをTXTとHTMLへエクスポートします",
     authors: [{ name: "aki_0", id: 0n }],
     settings,
     contextMenus: {
         "guild-context": guildMenu,
         "guild-header-popout": guildMenu,
-        "channel-context": channelMenu
+        "channel-context": channelMenu,
+        "user-context": dmMenu,
+        "gdm-context": dmMenu
     },
     start() {
         if (subscribed) return;
