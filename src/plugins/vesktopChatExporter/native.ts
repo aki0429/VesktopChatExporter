@@ -101,6 +101,22 @@ export async function saveCrawlState(_: IpcMainInvokeEvent, state: CrawlState) {
     await writeFile(statePath(), JSON.stringify(state, null, 2), "utf8");
 }
 
+function snowflakeOf(value: string): bigint | null {
+    return /^\d{17,20}$/.test(value) ? BigInt(value) : null;
+}
+
+// Snowflake ids embed the send time, so they order messages reliably even when the
+// timestamp formats of two events differ (e.g. ".180000+00:00" vs ".212Z").
+function compareChronologically(a: HistoryMessage, b: HistoryMessage) {
+    const left = snowflakeOf(a.messageId);
+    const right = snowflakeOf(b.messageId);
+    if (left !== null && right !== null && left !== right) return left < right ? -1 : 1;
+    const at = Date.parse(a.timestamp ?? "");
+    const bt = Date.parse(b.timestamp ?? "");
+    if (!Number.isNaN(at) && !Number.isNaN(bt) && at !== bt) return at - bt;
+    return 0;
+}
+
 export async function saveHistoryPage(
     _: IpcMainInvokeEvent,
     category: string | undefined,
@@ -114,16 +130,19 @@ export async function saveHistoryPage(
     const directory = join(rootDir(category), `${safeFileName(guildName)}_${guildId}`, "History", `${safeFileName(channelName)}_${channelId}`);
     await mkdir(directory, { recursive: true });
 
-    // A page is named by its newest/oldest snowflakes. Re-fetching the same page
-    // overwrites the same files instead of duplicating the archive.
-    const newest = messages[0].messageId;
-    const oldest = messages[messages.length - 1].messageId;
-    const base = `${newest}_${oldest}`;
-    const txt = messages.map(message => {
+    // Nothing may be dropped, the archive must read oldest -> newest: Discord pages
+    // arrive newest -> oldest, so sort them back into chronological order and name the
+    // chunk by its oldest snowflake first. A re-fetch of the same page overwrites the
+    // same two files instead of duplicating the archive.
+    const ordered = [...messages].sort(compareChronologically);
+    const oldest = ordered[0].messageId;
+    const newest = ordered[ordered.length - 1].messageId;
+    const base = `${oldest}_${newest}`;
+    const txt = ordered.map(message => {
         const links = message.attachments.map(a => `[添付] ${a.filename}: ${a.url}`).join("\n");
         return `[${message.timestamp}] ${message.author} (${message.authorId}) [${message.messageId}]\n${message.content}${links ? `\n${links}` : ""}`;
     }).join("\n\n") + "\n";
-    const articles = messages.map(message => `<article><div class="meta"><b>${escapeHtml(message.author)}</b> <span>${escapeHtml(message.timestamp)}</span> <code>${message.messageId}</code></div><div class="content">${escapeHtml(message.content).replace(/\n/g, "<br>")}</div>${message.attachments.map(a => `<a href="${escapeHtml(a.url)}">📎 ${escapeHtml(a.filename)}</a>`).join("")}</article>`).join("\n");
+    const articles = ordered.map(message => `<article><div class="meta"><b>${escapeHtml(message.author)}</b> <span>${escapeHtml(message.timestamp)}</span> <code>${message.messageId}</code></div><div class="content">${escapeHtml(message.content).replace(/\n/g, "<br>")}</div>${message.attachments.map(a => `<a href="${escapeHtml(a.url)}">📎 ${escapeHtml(a.filename)}</a>`).join("")}</article>`).join("\n");
     const html = `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHtml(guildName)} #${escapeHtml(channelName)}</title><style>body{max-width:1000px;margin:auto;padding:24px;background:#1e1f22;color:#dbdee1;font:14px system-ui}article{padding:10px;border-bottom:1px solid #34363b}.meta span,.meta code{color:#949ba4;font-size:11px}.content{margin:5px 0;line-height:1.5}a{display:block;color:#00a8fc}</style></head><body><h1>${escapeHtml(guildName)} / #${escapeHtml(channelName)}</h1>${articles}</body></html>`;
     await Promise.all([
         writeFile(join(directory, `${base}.txt`), txt, "utf8"),

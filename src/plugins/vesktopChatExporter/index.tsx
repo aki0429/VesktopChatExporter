@@ -55,7 +55,7 @@ const settings = definePluginSettings({
         default: true
     },
     forceHistoryCrawl: {
-        description: "起動中、全サーバーの閲覧可能な履歴を最新から古い順に低速で自動収集する",
+        description: "起動中、閲覧可能な全チャンネル・スレッドの履歴を古い順で自動収集する（取得は最新側から低速でページ取得）",
         type: OptionType.BOOLEAN,
         default: true
     },
