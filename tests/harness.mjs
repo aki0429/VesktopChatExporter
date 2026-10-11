@@ -12,7 +12,7 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
     const channelMap = Object.fromEntries(channels.map(c => [c.id, c]));
     const guildMap = Object.fromEntries(guilds.map(g => [g.id, g]));
     const userMap = Object.fromEntries(users.map(u => [u.id, u]));
-    const requests = [], saved = [], toasts = [], errors = [], waits = [];
+    const requests = [], saved = [], toasts = [], errors = [], waits = [], timers = [];
     const store = {
         getChannel: id => channelMap[id],
         getSortedPrivateChannels: () => privateChannels ?? channels.filter(c => [1, 3].includes(c.type)),
@@ -42,7 +42,7 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
     const dirOf = category => `fixture/${category ?? "logs"}`;
     // Mirrors native.ts: a channel folder name is sanitised before it becomes a path segment.
     const safeName = value => String(value ?? "").replace(/[\\/:*?"<>|]/g, "_").trim().slice(0, 80) || "server";
-    const partsDir = (category, baseName, channelId, channelName) => `${dirOf(category)}/${safeName(baseName)}.parts/${channelId}_${safeName(channelName)}`;
+    const partsDir = (category, baseName, channelId, channelName) => `${dirOf(category)}/${safeName(baseName)}.parts/${channelId}`;
     const pageStore = (category, baseName, channelId) => {
         const key = `${category ?? ""}|${baseName}|${channelId}`;
         if (!pages.has(key)) pages.set(key, new Map());
@@ -52,6 +52,19 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
     const byId = (left, right) => left < right ? -1 : left > right ? 1 : 0;
     const helpers = {
         loadCrawlState: async () => ({}), saveCrawlState: async () => {},
+        checkpointExport: async (category, baseName, record) => {
+            files.set(`${dirOf(category)}/${baseName}.manifest.json`, record);
+        },
+        loadPendingExport: async (category, targetId) => {
+            const candidates = [...files].filter(([file]) => file.startsWith(`${dirOf(category)}/`) && file.endsWith(".manifest.json"))
+                .map(([file, record]) => ({ base: file.slice(`${dirOf(category)}/`.length, -".manifest.json".length), manifest: JSON.parse(record) }))
+                .filter(({ manifest }) => manifest.version === 2 && manifest.targetId === targetId && manifest.outcome !== "complete" && Array.isArray(manifest.progress));
+            return candidates.at(-1) ?? null;
+        },
+        abortExportFiles: async (category, baseName) => {
+            for (const ext of [".txt", ".html", ".txt.partial", ".html.partial", ".summary.pending.json"])
+                files.delete(`${dirOf(category)}/${baseName}${ext}`);
+        },
         saveLogs: async (...args) => { saved.push({ kind: "export", args }); return { directory: "fixture" }; },
         appendLiveMessage: async (...args) => { saved.push({ kind: "live", args }); },
         // The background crawler stores one finished page per call, like the native side.
@@ -75,8 +88,9 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
         },
         startExportFiles: async (category, baseName, txtHeader, htmlHeader) => {
             saved.push({ kind: "export-files", args: [category, baseName, txtHeader, htmlHeader] });
-            files.set(`${dirOf(category)}/${baseName}.txt`, txtHeader);
-            files.set(`${dirOf(category)}/${baseName}.html`, htmlHeader);
+            await helpers.abortExportFiles(category, baseName);
+            files.set(`${dirOf(category)}/${baseName}.txt.partial`, txtHeader);
+            files.set(`${dirOf(category)}/${baseName}.html.partial`, htmlHeader);
             return {
                 directory: dirOf(category), base: baseName,
                 txtPath: `${dirOf(category)}/${baseName}.txt`,
@@ -86,19 +100,33 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
         },
         appendExport: async (category, baseName, fragment) => {
             saved.push({ kind: "export", args: [category, baseName, fragment] });
-            if (fragment.txt) append(`${dirOf(category)}/${baseName}.txt`, fragment.txt);
-            if (fragment.html) append(`${dirOf(category)}/${baseName}.html`, fragment.html);
+            if (fragment.txt) append(`${dirOf(category)}/${baseName}.txt.partial`, fragment.txt);
+            if (fragment.html) append(`${dirOf(category)}/${baseName}.html.partial`, fragment.html);
             return { written: (fragment.txt ? 1 : 0) + (fragment.html ? 1 : 0) };
         },
         finishExport: async (category, baseName, summary, txtFooter, htmlFooter) => {
             saved.push({ kind: "export-finish", args: [category, baseName, txtFooter, htmlFooter] });
-            append(`${dirOf(category)}/${baseName}.txt`, txtFooter);
-            append(`${dirOf(category)}/${baseName}.html`, htmlFooter);
-            append(`${dirOf(category)}/${baseName}.manifest.json`, `\n${summary}`);
+            append(`${dirOf(category)}/${baseName}.txt.partial`, txtFooter);
+            append(`${dirOf(category)}/${baseName}.html.partial`, htmlFooter);
+            const manifestPath = `${dirOf(category)}/${baseName}.manifest.json`;
+            const started = JSON.parse(files.get(manifestPath));
+            files.set(`${dirOf(category)}/${baseName}.summary.pending.json`, JSON.stringify({ ...started, ...JSON.parse(summary) }));
             return { directory: dirOf(category), bytes: { txt: 1, html: 1, manifest: 1 } };
+        },
+        publishExport: async (category, baseName) => {
+            for (const ext of [".txt", ".html"]) {
+                const file = `${dirOf(category)}/${baseName}${ext}`;
+                files.set(file, files.get(`${file}.partial`));
+                files.delete(`${file}.partial`);
+            }
+            const pending = `${dirOf(category)}/${baseName}.summary.pending.json`;
+            files.set(`${dirOf(category)}/${baseName}.manifest.json`, files.get(pending));
+            files.delete(pending);
+            return { directory: dirOf(category) };
         },
         discardExport: async (category, baseName) => {
             saved.push({ kind: "export-discard", args: [category, baseName] });
+            await helpers.abortExportFiles(category, baseName);
             for (const name of [`${baseName}.txt`, `${baseName}.html`, `${baseName}.manifest.json`])
                 files.delete(`${dirOf(category)}/${name}`);
             // Like the native side, a discarded run takes this run's per-page parts with it.
@@ -135,6 +163,14 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
             }
             return { removed: bases.length };
         },
+        listExportChannelIds: async (category, baseName) => [...pages.keys()]
+            .filter(key => key.startsWith(`${category ?? ""}|${baseName}|`)).map(key => key.split('|').at(-1)),
+        purgeChannelPages: async (category, baseName, channelId) => {
+            saved.push({ kind: "history-discard", operation: "purge", channelId, args: [category, baseName, channelId] });
+            pages.delete(`${category ?? ""}|${baseName}|${channelId}`);
+            const prefix = `${partsDir(category, baseName, channelId, "")}/`;
+            for (const file of [...files.keys()]) if (file.startsWith(prefix)) files.delete(file);
+        },
         openLogFolder: async () => "fixture", ...native
     };
     const imports = {
@@ -161,10 +197,16 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
         VencordNative: { pluginHelpers: { VesktopChatExporter: helpers } },
         console: { error: (...args) => errors.push(args), warn: (...args) => errors.push(args) },
         // Waits are deterministic; do not launch the recurring five-minute crawl.
-        setTimeout: (fn, ms) => { waits.push(ms); if (fn.name !== "crawlAllHistory") queueMicrotask(fn); return 1; }, clearTimeout() {},
+        setTimeout: (fn, ms) => {
+            waits.push(ms);
+            const timer = { fn, ms, cleared: false };
+            timers.push(timer);
+            if (fn.name !== "crawlAllHistory") queueMicrotask(fn);
+            return timer;
+        }, clearTimeout(timer) { if (timer) timer.cleared = true; },
     };
     vm.runInNewContext(code, context, { filename });
-    return { plugin: context.module.exports.default, hooks: context.module.exports.testHooks, requests, saved, toasts, errors, waits, store, channelMap, files, pages };
+    return { plugin: context.module.exports.default, hooks: context.module.exports.testHooks, requests, saved, toasts, errors, waits, timers, store, channelMap, files, pages, native: helpers };
 }
 
 export const id = n => `100000000000000${String(n).padStart(3, "0")}`;

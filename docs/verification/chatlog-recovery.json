@@ -1,0 +1,104 @@
+{
+  "scope": "Chatlog manual export, recovery, background catch-up and live archive repair",
+  "base_commit": "032216e1603b4805459c1522a1740460c7ba1c09",
+  "authorization": { "restart": true, "push": true },
+  "automated_tests": {
+    "command": "node.exe --test --test-reporter=tap tests/*.test.mjs",
+    "tests": 311,
+    "passed": 311,
+    "failed": 0,
+    "cancelled": 0,
+    "skipped": 0
+  },
+  "typecheck": {
+    "workspace": "../VesktopConsentRecorder/.build-vencord",
+    "command": "node.exe node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+    "exit_code": 0
+  },
+  "build": {
+    "workspace": "../VesktopConsentRecorder/.build-vencord",
+    "command": "node.exe --require ./scripts/suppressExperimentalWarnings.js scripts/build/build.mjs --disable-updater",
+    "exit_code": 0,
+    "source_stage_identical": true,
+    "preserved_components": ["VesktopChatExporter", "VesktopConsentRecorder"],
+    "updater_disabled": true
+  },
+  "independent_review": {
+    "final_delegation": "deleg_544bac18",
+    "passed": true,
+    "security_concerns": [],
+    "logic_errors": [],
+    "focused_tests_passed": 26,
+    "additional_probes": [
+      "Restart retries revoked orphan deletion after temporary EACCES clears",
+      "Directory enumeration reads metadata only within this pending run",
+      "Invalid names and symlinks rejected; only ENOENT returns empty",
+      "Zero readable targets still scrub pending orphan pages before returning",
+      "Disabling orphan enumeration in a scratch control makes regression fail"
+    ]
+  },
+  "installed_artifacts": {
+    "backup": "backup-vencordFiles-20261012-073435",
+    "files_verified_by_sha256": 11,
+    "all_staged_installed_files_identical": true,
+    "vencordDesktopMain.js": "503b568231d61fc3a533b31c5f03d63e7563976a06f33a9f21fc25b78ac30c8b",
+    "vencordDesktopRenderer.js": "f0ebbd640abae309f1da3a4f08d0903dfca047a145b47ad52e5ade8e500b96fa"
+  },
+  "installed_behavior_synthetic_only": {
+    "menu_action": {
+      "label": "全チャンネルのログを保存（TXT + HTML）",
+      "label_unchanged": true,
+      "messages": 252,
+      "unique_message_ids": 252,
+      "page_files": 5,
+      "manifest_outcome": "complete",
+      "txt_oldest_first": true,
+      "html_articles": 252,
+      "html_closed": true,
+      "partial_files_remaining": false
+    },
+    "same_button_interruption_resume": {
+      "action_runs": 2,
+      "messages": 250,
+      "unique_message_ids": 250,
+      "page_files": 3,
+      "saved_cursor_reused": true,
+      "latest_page_refetched": false,
+      "manifest_outcome": "complete",
+      "txt_oldest_first": true,
+      "html_articles": 250,
+      "html_closed": true,
+      "partial_files_remaining": false
+    },
+    "live_archive": {
+      "arrival": [22, 21, 21],
+      "saved_order": [21, 22],
+      "messages": 2,
+      "unique_canonical_records": 2,
+      "duplicates_prevented": true
+    },
+    "temporary_fixture_cleanup_verified": true
+  },
+  "normal_startup": {
+    "main_processes": 1,
+    "debug_processes": 0,
+    "debug_port_open": false,
+    "plugin_settings_equal_predeployment_backup": true,
+    "blocked_guild_list_equal": true,
+    "blocked_channel_list_equal": true,
+    "recorder_settings_equal": true,
+    "crawl_state_identical_by_bytes": true,
+    "settings_file_byte_identical": false,
+    "only_semantic_settings_difference": "cloud.settingsSyncVersion automatically changes on settings updates"
+  },
+  "coverage_boundary": {
+    "real_discord": "BLOCKED_UNVERIFIED",
+    "reason": "Vesktop is logged out at /login; current user absent and guild count zero",
+    "no_automatic_login": true,
+    "no_saved_user_chat_body_or_credentials_read": true,
+    "no_messages_sent_or_membership_permission_changes": true,
+    "legacy_logs_unchanged": true,
+    "legacy_runs_without_version2_checkpoint_not_automatically_resumable": true,
+    "persistent_filesystem_access_denial_cannot_guarantee_physical_deletion": true
+  }
+}

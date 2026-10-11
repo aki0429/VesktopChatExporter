@@ -6,7 +6,7 @@ import { createRequire } from "node:module";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { id } from "./harness.mjs";
+import { id, loadPlugin } from "./harness.mjs";
 
 const require = createRequire(import.meta.url);
 const source = fileURLToPath(new URL("../src/plugins/vesktopChatExporter/native.ts", import.meta.url));
@@ -112,6 +112,11 @@ test("per-page JSON parts are written as each page arrives, listed oldest-first 
         // A page that was never written, and a traversal attempt, are both refused.
         await assert.rejects(() => native.readHistoryPage(null, undefined, run, channel, "chrono", "../../secret"));
         assert.equal((await native.discardHistoryPages(null, undefined, run, channel, "chrono", ["../../secret"])).removed, 0);
+        // When revocation removes the last page, the directory must not keep the private channel's
+        // id/name either. Partial page removal above must still retain the other valid page.
+        await native.discardHistoryPages(null, undefined, run, channel, "chrono", [second.base]);
+        const channelFolders = await readdir(path.dirname(path.dirname(second.path)));
+        assert.ok(!channelFolders.some(folder => folder.includes(channel)), "no revoked channel folder may survive");
     } finally {
         await rm(dir, { recursive: true, force: true });
     }
@@ -133,14 +138,20 @@ test("the run stub is opened first, the aggregate files only after the re-check,
         const started = await native.startExportFiles(null, undefined, run, "HEADER\n", "<html>HEAD");
         assert.equal(started.txtPath, opened.txtPath);
         assert.equal(started.htmlPath, opened.htmlPath);
+        await assert.rejects(() => readFile(opened.txtPath, "utf8"), "the final TXT is not a partial header");
+        await assert.rejects(() => readFile(opened.htmlPath, "utf8"), "the final HTML is not partial navigation");
         await native.appendExport(null, undefined, run, { txt: "page one\n", html: "<article>1</article>" });
         await native.appendExport(null, undefined, run, { txt: "page two\n" });
         const done = await native.finishExport(null, undefined, run, "{\"outcome\":\"complete\"}", "FOOTER\n", "</html>");
+        await assert.rejects(() => readFile(opened.txtPath, "utf8"));
+        const published = await native.publishExport(null, undefined, run);
 
         assert.equal(await readFile(opened.txtPath, "utf8"), "HEADER\npage one\npage two\nFOOTER\n");
         assert.equal(await readFile(opened.htmlPath, "utf8"), "<html>HEAD<article>1</article></html>");
-        assert.match(await readFile(opened.manifestPath, "utf8"), /"outcome":"complete"/);
-        assert.ok(done.bytes.txt > 0 && done.bytes.manifest > 0);
+        const manifest = JSON.parse(await readFile(opened.manifestPath, "utf8"));
+        assert.equal(manifest.tool, "fixture", "the started run metadata remains available");
+        assert.equal(manifest.outcome, "complete", "the finished run is one valid JSON document");
+        assert.ok(done.bytes.txt > 0 && published.bytes.manifest > 0);
     } finally {
         await rm(dir, { recursive: true, force: true });
     }
@@ -159,6 +170,45 @@ test("page readers refuse a channel id that is not a snowflake", async () => {
         assert.equal((await native.discardHistoryPages(null, undefined, run, "../../etc", "chan", [written.base])).removed, 0);
         // The valid page is untouched by those refused calls.
         assert.deepEqual([...await native.listHistoryPages(null, undefined, run, id(1), "chan")], [written.base]);
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("the unchanged guild menu completes a multi-page export through the real native writer", async () => {
+    const dir = await mkdtemp(path.join(process.env.TMPDIR, "vesktop-menu-writer-"));
+    try {
+        const writer = await loadNative(dir);
+        const native = Object.fromEntries(Object.entries(writer).map(([key, fn]) => [key, (...args) => fn(null, ...args)]));
+        const guild = { id: id(100), name: "Fixture guild" };
+        const channel = { id: id(1), guild_id: guild.id, name: "fixture", type: 0 };
+        const base = 400000000000000000n;
+        const app = loadPlugin({ guilds: [guild], channels: [channel], native, rest: ({ url, query }) => {
+            if (!url.endsWith("/messages")) return { body: { threads: [], has_more: false } };
+            const before = query?.before ? Number(BigInt(query.before) - base) : 251;
+            const end = Math.min(250, before - 1);
+            const start = Math.max(1, end - 99);
+            return { body: Array.from({ length: Math.max(0, end - start + 1) }, (_, i) => ({
+                id: String(base + BigInt(end - i)), content: `row ${end - i}`,
+                timestamp: "2026-01-01T00:00:00.000Z", author: { id: id(999), username: "fixture" }
+            })) };
+        } });
+        const menu = [];
+        app.plugin.contextMenus["guild-context"](menu, { guild });
+        const action = menu.find(item => item?.props?.id === "vc-export-guild-chat");
+        assert.equal(action.props.label, "全チャンネルのログを保存（TXT + HTML）");
+        await action.props.action();
+        const directory = path.join(dir, "VesktopChatLogs");
+        const files = await readdir(directory);
+        const txt = await readFile(path.join(directory, files.find(file => file.endsWith(".txt"))), "utf8");
+        assert.deepEqual([...txt.matchAll(/^row (\d+)$/gm)].map(match => Number(match[1])), Array.from({ length: 250 }, (_, i) => i + 1));
+        const html = await readFile(path.join(directory, files.find(file => file.endsWith(".html"))), "utf8");
+        assert.equal((html.match(/<article>/g) ?? []).length, 250);
+        const manifest = JSON.parse(await readFile(path.join(directory, files.find(file => file.endsWith(".manifest.json"))), "utf8"));
+        assert.equal(manifest.messages, 250);
+        assert.equal(manifest.savedChannels, 1);
+        assert.equal(manifest.outcome, "complete");
+        assert.ok(app.toasts.some(toast => toast[1] === "success"));
     } finally {
         await rm(dir, { recursive: true, force: true });
     }

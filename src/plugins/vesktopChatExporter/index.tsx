@@ -27,6 +27,7 @@ import {
 } from "@webpack/common";
 
 import { discoverGuildTargets, DiscoveryIssue, MessageTarget } from "./targets";
+import { createHistoryCrawler, CrawlResult, nextHistoryDelay } from "./historyCrawl";
 
 const Native = VencordNative.pluginHelpers.VesktopChatExporter as PluginNative<typeof import("./native")>;
 
@@ -141,12 +142,15 @@ function getDmChannels(): Channel[] {
     try {
         list = store.getSortedPrivateChannels?.() ?? [];
     } catch { /* store not ready yet */ }
-    if (!list.length) {
-        try {
-            list = Object.values(store.getMutablePrivateChannels?.() ?? {});
-        } catch { /* ignore */ }
+    try {
+        list = [...list, ...Object.values(store.getMutablePrivateChannels?.() ?? {})];
+    } catch { /* ignore */ }
+    const resolved = new Map<string, Channel>();
+    for (const entry of list) {
+        const channel = typeof entry === "string" ? store.getChannel(entry) : entry?.channel ?? entry;
+        if (channel?.id) resolved.set(channel.id, channel);
     }
-    return list
+    return [...resolved.values()]
         .filter((channel: any) => isDmChannel(channel) && !isLoggingBlocked(undefined, channel.id))
         .sort((a: any, b: any) => String(channelLabel(a)).localeCompare(String(channelLabel(b)), "ja"));
 }
@@ -221,9 +225,12 @@ let subscribed = false;
 let crawlRunning = false;
 let crawlStopped = false;
 let crawlTimer: ReturnType<typeof setTimeout> | undefined;
+let crawlGeneration = 0;
+let activeCrawlGeneration = 0;
 let requestCount = 0;
 let adaptiveDelay = 1000;
 const savedLiveIds = new Set<string>();
+const liveInFlight = new Set<string>();
 // Adaptive pacing: the configured interval is the floor. The controller slows down on 429s and
 // request failures, then speeds back up after a run of successes so a full history crawl finds a
 // rate the account can sustain instead of hammering Discord at a fixed speed.
@@ -342,7 +349,9 @@ async function collectGuildTargets(guildId: string, running: () => boolean, scan
 }
 
 function issueText(issues: DiscoveryIssue[]) {
-    return issues.map(issue => `${issue.scope}: ${issue.message}${issue.status ? ` (HTTP ${issue.status})` : ""}`).join("\n");
+    // Request scopes contain channel IDs. They are diagnostic-only and never belong in an
+    // archive whose permission checks may have removed that channel after discovery.
+    return issues.map(issue => `Thread discovery: ${issue.message}${issue.status ? ` (HTTP ${issue.status})` : ""}`).join("\n");
 }
 
 // Snowflake ids order messages by time; compare them as numbers instead of trusting the API order.
@@ -357,21 +366,22 @@ function compareIds(left: string, right: string) {
 // is the only page in memory: a channel with hundreds of thousands of messages never has to fit in
 // RAM and every page is on disk before the next request goes out. The cursor must move back every
 // round; a page that does not move it stops the loop instead of spinning.
-async function walkChannelHistory(channel: MessageTarget, allowed: () => boolean, onPage: (page: RawMessage[]) => Promise<void>) {
-    let before: string | undefined;
+async function walkChannelHistory(channel: MessageTarget, allowed: () => boolean, onPage: (page: RawMessage[]) => Promise<void>, initialBefore?: string) {
+    let before = initialBefore;
     for (;;) {
-        if (cancelled) return;
+        if (cancelled || pluginStopped || authFailed) return false;
         const page = await getMessagePage(channel.id, { before }, () => !cancelled && allowed());
-        if (!page.length) return;
+        if (!page.length) return true;
         // Re-check after the response: a channel whose access was revoked while the request was in
         // flight must never reach storage.
         if (!allowed()) throw new Error("閲覧権限が取り消されたため中止しました");
         const ordered = [...page].sort((left, right) => compareIds(left.id, right.id));
         const oldest = ordered[0].id;
-        if (before && compareIds(oldest, before) >= 0) throw new Error("履歴カーソルが進みません");
+        if (new Set(ordered.map(message => message.id)).size !== ordered.length
+            || before && compareIds(ordered[ordered.length - 1].id, before) >= 0) throw new Error("履歴カーソルが進みません");
         await onPage(ordered);
         before = oldest;
-        if (page.length < 100) return;
+        if (page.length < 100) return true;
     }
 }
 
@@ -407,6 +417,7 @@ function queuedGet(url: string, query: Record<string, string | number | boolean>
             if (pluginStopped || authFailed || !allowed()) throw new Error("収集を中止しました");
         };
         let indexRetried = false;
+        let transientRetries = 0;
         for (;;) {
             check();
             await sleep(pacedDelay());
@@ -433,6 +444,13 @@ function queuedGet(url: string, query: Record<string, string | number | boolean>
                 if (statusOf(error) !== 429) {
                     // Any other failure slows the pace too, exactly as the setting promises.
                     adaptiveDelay = nextDelay(adaptiveDelay, "error", baseDelay());
+                    const status = statusOf(error);
+                    if (typeof status === "number" && status >= 500 && status <= 599 && transientRetries < 2) {
+                        check();
+                        transientRetries++;
+                        await sleep(Math.min(DELAY_CEILING, 2_000 * transientRetries));
+                        continue;
+                    }
                     throw error;
                 }
                 const wait = retryAfterMs(error);
@@ -506,72 +524,52 @@ function buildContainers(): Container[] {
     return containers;
 }
 
+const historyCrawler = createHistoryCrawler<RawMessage>({
+    loadState: () => Native.loadCrawlState(),
+    saveState: state => Native.saveCrawlState(state),
+    getContainers: buildContainers,
+    makeScan: buildActiveScan,
+    discover: (container, running, scan) => collectGuildTargets(container.id, running, scan),
+    allowed: (container, channel) => (!container.category || settings.store.crawlDms)
+        && !isTargetBlocked(channel) && canReadTarget(channel),
+    getPage: getMessagePage,
+    savePage: async (container, channel, messages) => {
+        const saved = await Native.saveHistoryPage(container.category, container.id, container.name, channel.id,
+            channelLabel(channel), messages.map(message => toHistoryMessage(message, container, channel)));
+        if (!saved || saved.count !== messages.length) throw new Error("History storage did not confirm the page");
+    },
+    running: () => activeCrawlGeneration === crawlGeneration && !crawlStopped && !pluginStopped && !authFailed && settings.store.forceHistoryCrawl,
+    manualActive: () => exporting,
+    report: event => {
+        console.warn("[VesktopChatExporter] history incomplete", event.kind, event.count, event.status ?? "unknown");
+        showToast(`自動履歴収集: ${event.count}件を取得できず不完全です`, Toasts.Type.FAILURE);
+    },
+    wait: sleep,
+    now: () => new Date().toISOString()
+});
+
 async function crawlAllHistory() {
-    if (crawlRunning || !settings.store.forceHistoryCrawl) return;
-    crawlRunning = true;
-    crawlStopped = false;
-    try {
-        const state = await Native.loadCrawlState();
-        const running = () => !crawlStopped && !pluginStopped && !authFailed && settings.store.forceHistoryCrawl;
-        // Advance the rotation cursor for this cycle before any request can abort the run.
-        const scanActive = buildActiveScan(state);
-        await Native.saveCrawlState(state);
-        for (const container of buildContainers()) {
-            if (!running()) return;
-            const discovery = container.discover ? await collectGuildTargets(container.id, running, scanActive) : { channels: container.channels, issues: [] };
-            if (discovery.issues.length) {
-                console.warn("[VesktopChatExporter] incomplete discovery", issueText(discovery.issues));
-                showToast(`${container.name}: スレッド一覧の一部を取得できませんでした`, Toasts.Type.FAILURE);
-            }
-            for (const channel of discovery.channels) {
-                if (!running()) return;
-                const allowed = () => running() && (!container.category || settings.store.crawlDms)
-                    && !isTargetBlocked(channel) && canReadTarget(channel);
-                if (!allowed()) continue;
-                const key = `${container.id}:${channel.id}`;
-                const saved = state[key] ?? {};
-                if (saved.completed) continue;
-                let before = saved.before;
-                while (!crawlStopped && settings.store.forceHistoryCrawl) {
-                    // The channel may have been added to the stop list while this loop was running.
-                    if (!allowed()) break;
-                    try {
-                        const page = await getMessagePage(channel.id, { before }, allowed);
-                        if (!allowed()) break;
-                        if (!page.length) {
-                            state[key] = { before, completed: true, updatedAt: new Date().toISOString() };
-                            await Native.saveCrawlState(state);
-                            break;
-                        }
-                        await Native.saveHistoryPage(
-                            container.category,
-                            container.id,
-                            container.name,
-                            channel.id,
-                            channelLabel(channel),
-                            page.map(message => toHistoryMessage(message, container, channel))
-                        );
-                        if (before && BigInt(page[page.length - 1].id) >= BigInt(before)) throw new Error("履歴カーソルが進みません");
-                        before = page[page.length - 1].id; // API is newest -> oldest.
-                        state[key] = { before, completed: page.length < 100, updatedAt: new Date().toISOString() };
-                        await Native.saveCrawlState(state);
-                        if (page.length < 100) break;
-                    } catch (error) {
-                        console.error(`[VesktopChatExporter] crawl failed for ${channel.id}`, statusOf(error) ?? "request/save failed");
-                        if (!running()) return;
-                        // Non-429 errors do not spin: pause and continue with the next channel.
-                        await sleep(30_000);
-                        break;
-                    }
-                }
-            }
+    if (crawlRunning) {
+        if (!pluginStopped && !authFailed && activeCrawlGeneration !== crawlGeneration) {
+            if (crawlTimer) clearTimeout(crawlTimer);
+            crawlTimer = setTimeout(crawlAllHistory, 10_000);
         }
-    } catch (error) {
-        console.error("[VesktopChatExporter] history interrupted", statusOf(error) ?? "request/save failed");
+        return;
+    }
+    if (crawlTimer) clearTimeout(crawlTimer);
+    crawlTimer = undefined;
+    crawlRunning = true;
+    const generation = crawlGeneration;
+    activeCrawlGeneration = generation;
+    let result: CrawlResult | undefined;
+    try {
+        if (!pluginStopped && !authFailed) result = await historyCrawler.run();
     } finally {
         crawlRunning = false;
-        if (!crawlStopped && !pluginStopped && !authFailed && settings.store.forceHistoryCrawl)
-            crawlTimer = setTimeout(crawlAllHistory, 5 * 60_000);
+        if (generation !== crawlGeneration) return;
+        const delay = nextHistoryDelay({ canSchedule: !crawlStopped && !pluginStopped && !authFailed,
+            enabled: settings.store.forceHistoryCrawl, manualActive: exporting, yielded: result?.yielded, bounded: result?.bounded });
+        if (delay !== undefined) crawlTimer = setTimeout(crawlAllHistory, delay);
     }
 }
 
@@ -674,143 +672,290 @@ async function exportChannels(container: Container, label: string) {
     if (exporting) return showToast("既にエクスポート中です", Toasts.Type.MESSAGE);
     exporting = true; cancelled = false;
     let total = 0, savedChannels = 0;
+    type Progress = { channel: MessageTarget; pages: string[]; before?: string; completed?: boolean; messages: number; };
+    let base = "";
+    let progress: Progress[] = [];
+    const pendingPurges = new Set<string>();
+    let manifest: { tool: string; version: number; started: string; target: string; targetId: string; discovered: number; };
+    let fetched = 0, revoked = 0;
+    const checkpoint = async (phase: string, outcome = "running") => {
+        if (base) await Native.checkpointExport(container.category, base, JSON.stringify({ ...manifest, phase, outcome, fetched, revoked, progress }));
+    };
+    const scrubProgress = async () => {
+        const removed = progress.filter(entry => isTargetBlocked(entry.channel) || !canReadTarget(entry.channel));
+        progress = progress.filter(entry => !removed.includes(entry));
+        revoked += removed.length;
+        for (const entry of removed) pendingPurges.add(entry.channel.id);
+        if (!pendingPurges.size) return;
+        // Invalidate publication before any fallible deletion. Drain both operations independently,
+        // and retain failed purge work even after its identity has been removed from the manifest.
+        const invalidation = await Promise.allSettled([checkpoint("scrubbed", "incomplete"), Native.abortExportFiles(container.category, base)]);
+        const ids = [...pendingPurges];
+        const results = await Promise.allSettled(ids.map(id => Native.purgeChannelPages(container.category, base, id)));
+        results.forEach((result, index) => { if (result.status === "fulfilled") pendingPurges.delete(ids[index]); });
+        if ([...invalidation, ...results].some(result => result.status === "rejected")) throw new Error("Revoked page cleanup failed");
+    };
     try {
+        const pending = await Native.loadPendingExport(container.category, container.id);
+        if (pending) {
+            base = pending.base;
+            // Only counts and the target identity are run metadata. A prior incomplete summary
+            // may contain a now-revoked channel list or notice; never spread that into a checkpoint.
+            manifest = { tool: "VesktopChatExporter", version: 2, started: pending.manifest.started,
+                target: label, targetId: container.id, discovered: pending.manifest.discovered };
+            progress = pending.manifest.progress;
+            revoked = pending.manifest.revoked ?? 0;
+            fetched = pending.manifest.fetched ?? 0;
+            // Failed deletions and crash-before-checkpoint pages are not in progress. Scan only
+            // this pending run's directory names, never their bodies, and remove those orphans
+            // before discovery can return early or assembly can publish again.
+            const storedIds = await Native.listExportChannelIds(container.category, base);
+            for (const id of storedIds) if (!progress.some(entry => entry.channel.id === id)) pendingPurges.add(id);
+            await scrubProgress();
+        }
         const discovery = container.discover ? await collectGuildTargets(container.id, () => !cancelled, () => true)
-            : { channels: container.channels, issues: [] };
+            : { channels: container.channels.filter(channel => !isTargetBlocked(channel) && canReadTarget(channel)), issues: [] };
         const { channels, issues } = discovery;
         if (cancelled || pluginStopped || authFailed) return;
         if (!channels.length) {
+            if (pending && !progress.length) await Native.discardExport(container.category, base);
             if (issues.length) showToast(`${label}: スレッド一覧を取得できず不完全です`, Toasts.Type.FAILURE);
             showToast(isLoggingBlocked(container.id) ? `${label}: この対象は停止リストに含まれています` : `${label}: 取得できるチャンネルがありません`, Toasts.Type.FAILURE);
             return;
         }
         const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-        const base = `${safeName(label)}_${container.id}_${stamp}`;
+        base = pending?.base ?? `${safeName(label)}_${container.id}_${stamp}`;
         // The run is opened with counts only. The manifest channel list and the html navigation are
         // written after the phase-2 re-check (startExportFiles), from the channels the run really
         // saved, so a channel revoked mid-run can never survive in the output as a name or a link.
-        const manifest = {
+        manifest = {
             tool: "VesktopChatExporter",
-            started: new Date().toISOString(),
+            version: 2,
+            started: pending?.manifest.started ?? new Date().toISOString(),
             target: label,
             targetId: container.id,
             discovered: channels.length
         };
-        const opened = await Native.beginExport(container.category, base, `${JSON.stringify(manifest, null, 2)}\n`);
-        showToast(`${label}: ${channels.length}件の取得を開始（逐次保存）`, Toasts.Type.MESSAGE);
+        const prior = [...progress];
+        const validated: Progress[] = [];
+        for (const entry of prior) {
+            if (!channels.some(channel => channel.id === entry.channel.id) || isTargetBlocked(entry.channel) || !canReadTarget(entry.channel)) {
+                await Native.discardHistoryPages(container.category, base, entry.channel.id, channelLabel(entry.channel), entry.pages);
+                await Native.purgeChannelPages(container.category, base, entry.channel.id);
+                revoked++;
+            } else {
+                const ordered = [...entry.pages].sort((a, b) => compareIds(a.split("_")[0], b.split("_")[0]));
+                if (new Set(ordered).size !== ordered.length
+                    || ordered.length && entry.before !== ordered[0].split("_")[0]
+                    || !ordered.length && (entry.before || entry.messages)) throw new Error("再開cursorが保存ページと一致しません");
+                let count = 0;
+                let previousNewest: string | undefined;
+                let oldestCount = 0;
+                for (const page of ordered) {
+                    const stored = await Native.readHistoryPage(container.category, base, entry.channel.id, channelLabel(entry.channel), page);
+                    if (isTargetBlocked(entry.channel) || !canReadTarget(entry.channel)) {
+                        await Native.purgeChannelPages(container.category, base, entry.channel.id);
+                        revoked++;
+                        count = -1;
+                        break;
+                    }
+                    if (!stored.length || previousNewest && compareIds(stored[0].messageId, previousNewest) <= 0)
+                        throw new Error("再開ページが重複しています");
+                    if (!count) oldestCount = stored.length;
+                    count += stored.length;
+                    previousNewest = stored[stored.length - 1].messageId;
+                }
+                if (count < 0) continue;
+                if (count !== entry.messages) throw new Error("再開ページの件数が一致しません");
+                // A full oldest page cannot prove EOF: re-check below its boundary on resume.
+                if (entry.completed && oldestCount === 100) entry.completed = false;
+                validated.push(entry);
+            }
+        }
+        progress = validated;
+        if (pending) await Native.abortExportFiles(container.category, base);
+        fetched = progress.reduce((sum, entry) => sum + entry.messages, 0);
+        const opened = await Native.beginExport(container.category, base, JSON.stringify({ ...manifest, phase: "fetching", outcome: "running", fetched, revoked, progress }));
+        await checkpoint("fetching");
+        showToast(`${label}: ${channels.length}件の取得${pending ? "を途中から再開" : "を開始"}（逐次保存）`, Toasts.Type.MESSAGE);
         // Phase 1: walk every channel and serialise each page to storage as it arrives. No page is
         // ever kept in memory after it has been written, so the run is bounded by the largest page
         // rather than by the size of the server, and a crash keeps everything already fetched.
-        const walked: { channel: MessageTarget; pages: string[]; }[] = [];
-        const failures: string[] = [];
-        let fetched = 0;
+        const walked: Progress[] = [];
+        const failures: { channel: MessageTarget; status: string | number; }[] = [];
         // A channel the account may not read is only ever counted: the run must leave no trace of it,
         // so it is never named in the manifest, the aggregate or the notices.
-        let revoked = 0;
         for (let i = 0; i < channels.length && !cancelled; i++) {
-            const channel = channels[i];
+            const channel = { ...channels[i] };
             const name = channelLabel(channel);
             const allowed = () => !isTargetBlocked(channel) && canReadTarget(channel);
-            if (!allowed()) { revoked++; continue; }
-            const pages: string[] = [];
+            if (!allowed()) {
+                revoked++;
+                progress = progress.filter(record => record.channel.id !== channel.id);
+                await Native.purgeChannelPages(container.category, base, channel.id);
+                await checkpoint("fetching");
+                continue;
+            }
+            let entry = progress.find(record => record.channel.id === channel.id);
+            if (!entry) { entry = { channel, pages: [], messages: 0 }; progress.push(entry); }
+            const pages = entry.pages;
+            if (entry.completed) { walked.push(entry); continue; }
             showToast(`[${i + 1}/${channels.length}] ${name} を取得中`, Toasts.Type.MESSAGE);
             try {
-                await walkChannelHistory(channel, allowed, async page => {
+                entry.completed = await walkChannelHistory(channel, allowed, async page => {
                     const stored = await Native.writeHistoryPageJson(container.category, base, channel.id, name, page.map(message => toHistoryMessage(message, container, channel)));
-                    if (stored) pages.push(stored.base);
+                    if (!stored || stored.count !== page.length) throw new Error("保存ページの件数が一致しません");
+                    if (!pages.includes(stored.base)) { pages.push(stored.base); entry.messages += stored.count; }
+                    entry.before = page[0].id;
+                    entry.completed = page.length < 100;
                     fetched += page.length;
+                    await checkpoint("fetching");
                     if (fetched % 500 === 0) showToast(`${name}: 累計${fetched}件保存`, Toasts.Type.MESSAGE);
-                });
+                }, entry.before);
+                await checkpoint("fetching");
             } catch (error) {
                 // Access revoked while this channel was being walked: discard this run's pages for it
                 // instead of reporting a named failure.
                 if (!allowed()) {
                     revoked++;
                     await Native.discardHistoryPages(container.category, base, channel.id, name, pages);
+                    await Native.purgeChannelPages(container.category, base, channel.id);
+                    progress = progress.filter(record => record !== entry);
+                    await checkpoint("fetching");
                     continue;
                 }
-                failures.push(`# ${name} (${channel.id}): 取得失敗 (HTTP ${statusOf(error) ?? "unknown"})`);
+                failures.push({ channel, status: statusOf(error) ?? "unknown" });
             }
-            walked.push({ channel, pages });
+            walked.push(entry);
+        }
+        if (pluginStopped || authFailed) {
+            if (!fetched) { await Native.discardExport(container.category, base); return; }
+            await Native.abortExportFiles(container.category, base);
+            await checkpoint("fetching", "paused");
+            return;
         }
         // Phase 2: re-check every channel after all the waits (a menu opened before blocking, or
         // access revoked while the run was under way, must not slip through), then open the aggregate
         // files from the surviving channels only and fill them from the pages already on disk,
         // oldest -> newest.
-        const surviving: { channel: MessageTarget; pages: string[]; }[] = [];
-        for (const entry of walked) {
-            if (isTargetBlocked(entry.channel) || !canReadTarget(entry.channel)) {
+        const surviving = [...walked];
+        const dropRevoked = async () => {
+            let changed = false;
+            for (let i = surviving.length - 1; i >= 0; i--) {
+                const entry = surviving[i];
+                if (!isTargetBlocked(entry.channel) && canReadTarget(entry.channel)) continue;
+                surviving.splice(i, 1);
+                progress = progress.filter(record => record !== entry);
                 revoked++;
-                await Native.discardHistoryPages(container.category, base, entry.channel.id, channelLabel(entry.channel), entry.pages);
-                continue;
+                changed = true;
+                pendingPurges.add(entry.channel.id);
             }
-            surviving.push(entry);
-        }
-        const savedList = surviving.map(entry => entry.channel);
-        await Native.startExportFiles(
-            container.category,
-            base,
-            exportTxtHeader(label, container.id, savedList),
-            exportHtmlHeader(label, container.id, savedList)
-        );
-        for (const { channel, pages } of surviving) {
-            const name = channelLabel(channel);
-            await Native.appendExport(container.category, base, { txt: channelTxtHeader(channel), html: channelHtmlHeader(channel) });
-            // Pages arrived newest-first; the native listing sorts them oldest-first.
-            const ordered = (await Native.listHistoryPages(container.category, base, channel.id, name)).filter(page => pages.includes(page));
-            for (const page of ordered) {
-                const stored = await Native.readHistoryPage(container.category, base, channel.id, name, page) as StoredMessage[];
-                total += stored.length;
-                await Native.appendExport(container.category, base, { txt: messagesTxtFragment(stored), html: messagesHtmlFragment(stored) });
-            }
-            await Native.appendExport(container.category, base, { html: "</section>" });
-            savedChannels++;
-        }
-        const notice = [
-            issueText(issues),
-            ...failures,
-            revoked ? `閲覧権限が取り消されたチャンネル: ${revoked}件（この実行の出力からは除外し、名前やIDも記録していません）` : ""
-        ].filter(Boolean).join("\n");
-        const summary = (outcome: string) => JSON.stringify({
-            finished: new Date().toISOString(),
-            outcome,
-            target: label,
-            targetId: container.id,
-            discovered: channels.length,
-            savedChannels,
-            revoked,
-            messages: total,
-            channels: savedList.map(channel => ({ id: channel.id, name: channelLabel(channel), type: channel.type })),
-            notice: notice || undefined
-        }, null, 2);
-        if (cancelled) {
-            if (!total) {
-                await Native.discardExport(container.category, base);
-                return showToast("エクスポートを中止しました（保存されたメッセージはありません）", Toasts.Type.FAILURE);
-            }
-            await Native.finishExport(
+            await scrubProgress();
+            return changed;
+        };
+        await dropRevoked();
+        await checkpoint("assembling");
+        // IPC file operations yield to Discord just like HTTP requests. Re-check the entire saved
+        // set after each await. If a channel was revoked after its header/body was appended, truncate
+        // and rebuild both aggregates from the remaining pages; a one-time snapshot cannot protect
+        // either the content or the sidebar. Each retry permanently drops at least one channel.
+        // Each permission retry removes a channel; cancellation adds at most one further retry.
+        assembly: for (let attempt = 0; attempt <= walked.length + 1; attempt++) {
+            total = 0; savedChannels = 0;
+            if (attempt) await checkpoint("assembling");
+            if (await dropRevoked()) continue;
+            const savedList = surviving.map(entry => entry.channel);
+            await Native.startExportFiles(
                 container.category,
                 base,
-                summary("cancelled"),
-                exportTxtFooter(total, savedChannels, "CANCELLED"),
-                exportHtmlFooter(total, savedChannels, "CANCELLED")
+                exportTxtHeader(label, container.id, savedList),
+                exportHtmlHeader(label, container.id, savedList)
             );
-            return showToast(`エクスポートを中止しました（保存済み: ${total}件 / ${opened.directory}）`, Toasts.Type.FAILURE);
+            if (await dropRevoked()) continue;
+            for (const entry of surviving) {
+                const { channel, pages } = entry;
+                const name = channelLabel(channel);
+                await Native.appendExport(container.category, base, { txt: channelTxtHeader(channel), html: channelHtmlHeader(channel) });
+                if (await dropRevoked()) continue assembly;
+                // Pages arrived newest-first; the native listing sorts them oldest-first.
+                const available = await Native.listHistoryPages(container.category, base, channel.id, name);
+                if (await dropRevoked()) continue assembly;
+                if (pages.some(page => !available.includes(page))) throw new Error("保存済みページが不足しています");
+                const ordered = available.filter(page => pages.includes(page));
+                let assembled = 0;
+                for (const page of ordered) {
+                    const stored = await Native.readHistoryPage(container.category, base, channel.id, name, page) as StoredMessage[];
+                    if (await dropRevoked()) continue assembly;
+                    if (!stored.length || stored.length > 100 || `${stored[0].messageId}_${stored[stored.length - 1].messageId}` !== page)
+                        throw new Error("保存済みページが破損しています");
+                    await Native.appendExport(container.category, base, { txt: messagesTxtFragment(stored), html: messagesHtmlFragment(stored) });
+                    if (await dropRevoked()) continue assembly;
+                    total += stored.length;
+                    assembled += stored.length;
+                }
+                if (assembled !== entry.messages) throw new Error("保存済み件数が一致しません");
+                await Native.appendExport(container.category, base, { html: "</section>" });
+                if (await dropRevoked()) continue assembly;
+                savedChannels++;
+            }
+            const notice = [
+                issueText(issues),
+                ...failures.filter(failure => savedList.some(channel => channel.id === failure.channel.id))
+                    .map(failure => `# ${channelLabel(failure.channel)} (${failure.channel.id}): 取得失敗 (HTTP ${failure.status})`),
+                revoked ? `閲覧権限が取り消されたチャンネル: ${revoked}件（この実行の出力からは除外し、名前やIDも記録していません）` : ""
+            ].filter(Boolean).join("\n");
+            const summary = (outcome: string) => JSON.stringify({
+                finished: new Date().toISOString(),
+                outcome,
+                target: label,
+                targetId: container.id,
+                discovered: channels.length,
+                savedChannels,
+                revoked,
+                messages: total,
+                channels: savedList.map(channel => ({ id: channel.id, name: channelLabel(channel), type: channel.type })),
+                notice: notice || undefined
+            }, null, 2);
+            if (!total) {
+                await Native.discardExport(container.category, base);
+                return showToast(cancelled ? "エクスポートを中止しました（保存されたメッセージはありません）"
+                    : `${label}: 保存できるメッセージがありませんでした`, cancelled || notice ? Toasts.Type.FAILURE : Toasts.Type.MESSAGE);
+            }
+            const incomplete = notice.length > 0 || savedChannels !== channels.length;
+            const finalCancelled = cancelled;
+            const saved = await Native.finishExport(
+                container.category,
+                base,
+                summary(finalCancelled ? "cancelled" : incomplete ? "incomplete" : "complete"),
+                exportTxtFooter(total, savedChannels, finalCancelled ? "CANCELLED" : notice),
+                exportHtmlFooter(total, savedChannels, finalCancelled ? "CANCELLED" : notice)
+            );
+            if (await dropRevoked()) continue;
+            if (cancelled !== finalCancelled) {
+                await checkpoint("assembling", "cancelled");
+                await Native.abortExportFiles(container.category, base);
+                continue;
+            }
+            await Native.publishExport(container.category, base);
+            if (await dropRevoked()) continue;
+            if (cancelled !== finalCancelled) {
+                await checkpoint("assembling", "cancelled");
+                await Native.abortExportFiles(container.category, base);
+                continue;
+            }
+            if (cancelled)
+                return showToast(`エクスポートを中止しました（保存済み: ${total}件 / ${opened.directory}）`, Toasts.Type.FAILURE);
+            return showToast(`${incomplete ? "一部のみ保存（不完全）" : "完了"}: ${total}件 / ${saved.directory}`, incomplete ? Toasts.Type.FAILURE : Toasts.Type.SUCCESS);
         }
-        if (!total) {
-            await Native.discardExport(container.category, base);
-            return showToast(`${label}: 保存できるメッセージがありませんでした`, issues.length ? Toasts.Type.FAILURE : Toasts.Type.MESSAGE);
-        }
-        const saved = await Native.finishExport(
-            container.category,
-            base,
-            summary(notice ? "incomplete" : "complete"),
-            exportTxtFooter(total, savedChannels, notice),
-            exportHtmlFooter(total, savedChannels, notice)
-        );
-        const incomplete = notice.length > 0 || savedChannels !== channels.length;
-        showToast(`${incomplete ? "一部のみ保存（不完全）" : "完了"}: ${total}件 / ${saved.directory}`, incomplete ? Toasts.Type.FAILURE : Toasts.Type.SUCCESS);
+        // Exhausting the monotone retry guard must never leave a stale authorized-looking output.
+        await Native.discardExport(container.category, base);
+        throw new Error("保存中に閲覧権限が変わり続けたため中止しました");
     } catch (error) {
+        if (base) {
+            try { await scrubProgress(); } catch { /* Still attempt both independent cleanup and checkpoint writes. */ }
+            try { await Native.abortExportFiles(container.category, base); } catch { /* Failed cleanup is not a complete export. */ }
+            try { await checkpoint("failed", "failed"); } catch { /* Preserve the last durable record when storage is unavailable. */ }
+        }
         showToast(`ログ保存に失敗 (HTTP ${statusOf(error) ?? "unknown"})`, Toasts.Type.FAILURE);
     } finally {
         exporting = false;
@@ -823,10 +968,6 @@ function exportGuild(guild: Guild) {
 }
 
 function exportDm(channel: Channel) {
-    if (isLoggingBlocked(undefined, channel.id)) {
-        showToast("このDMは停止リストに含まれています", Toasts.Type.FAILURE);
-        return;
-    }
     return exportChannels({ category: DM_CATEGORY, id: channel.id, name: channelLabel(channel), channels: [channel] }, channelLabel(channel));
 }
 
@@ -836,7 +977,7 @@ async function saveLiveMessage(event: { message?: RawMessage & { channel_id?: st
     // writes every own message twice; only the confirmed message is authoritative.
     if (event.optimistic) return;
     const message = event.message;
-    if (!message?.id || savedLiveIds.has(message.id)) return;
+    if (!message?.id || savedLiveIds.has(message.id) || liveInFlight.has(message.id)) return;
     const channel = ChannelStore.getChannel(message.channel_id!);
     if (!channel) return;
     const guildId = message.guild_id || (channel as any).guild_id;
@@ -862,8 +1003,7 @@ async function saveLiveMessage(event: { message?: RawMessage & { channel_id?: st
         return; // Other private/system channels are not logged.
     }
 
-    savedLiveIds.add(message.id);
-    if (savedLiveIds.size > 5000) savedLiveIds.delete(savedLiveIds.values().next().value!);
+    liveInFlight.add(message.id);
     try {
         await Native.appendLiveMessage({
             category,
@@ -878,8 +1018,12 @@ async function saveLiveMessage(event: { message?: RawMessage & { channel_id?: st
             content: richContent(message),
             attachments: (message.attachments ?? []).map(a => ({ filename: a.filename, url: a.url }))
         });
+        savedLiveIds.add(message.id);
+        if (savedLiveIds.size > 5000) savedLiveIds.delete(savedLiveIds.values().next().value!);
     } catch (error) {
-        console.error("[VesktopChatExporter] automatic save failed", error);
+        console.error("[VesktopChatExporter] automatic save failed", statusOf(error) ?? "storage failed");
+    } finally {
+        liveInFlight.delete(message.id);
     }
 }
 
@@ -945,19 +1089,24 @@ export default definePlugin({
     },
     start() {
         if (subscribed) return;
+        crawlGeneration++;
         pluginStopped = false;
+        crawlStopped = false;
         authFailed = false;
         FluxDispatcher.subscribe("MESSAGE_CREATE", saveLiveMessage);
         subscribed = true;
         Native.openLogFolder().catch(() => {});
         // Give Discord stores time to populate before starting the low-rate crawl.
+        if (crawlTimer) clearTimeout(crawlTimer);
         crawlTimer = setTimeout(crawlAllHistory, 10_000);
     },
     stop() {
+        crawlGeneration++;
         pluginStopped = true;
         cancelled = true;
         crawlStopped = true;
         if (crawlTimer) clearTimeout(crawlTimer);
+        crawlTimer = undefined;
         if (!subscribed) return;
         FluxDispatcher.unsubscribe("MESSAGE_CREATE", saveLiveMessage);
         subscribed = false;
