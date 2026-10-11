@@ -11,6 +11,7 @@ import {
     Constants,
     Forms,
     GuildChannelStore,
+    JoinedThreadsStore,
     Menu,
     PermissionStore,
     PermissionsBits,
@@ -21,8 +22,11 @@ import {
     Toasts,
     FluxDispatcher,
     ChannelStore,
-    GuildStore
+    GuildStore,
+    UserStore
 } from "@webpack/common";
+
+import { discoverGuildTargets, DiscoveryIssue, MessageTarget } from "./targets";
 
 const Native = VencordNative.pluginHelpers.VesktopChatExporter as PluginNative<typeof import("./native")>;
 
@@ -92,6 +96,11 @@ function isLoggingBlocked(guildId?: string | null, channelId?: string | null) {
     return false;
 }
 
+function isTargetBlocked(channel: { id: string; guild_id?: string; parent_id?: string; }) {
+    return isLoggingBlocked(channel.guild_id, channel.id)
+        || (!!channel.parent_id && isLoggingBlocked(channel.guild_id, channel.parent_id));
+}
+
 function toggleBlockedId(key: "blockedGuildIds" | "blockedChannelIds", id: string) {
     const list = parseIdList((settings.store as any)[key]);
     const next = list.includes(id) ? list.filter(entry => entry !== id) : [...list, id];
@@ -110,12 +119,14 @@ function recipientName(user: any): string {
 // Human readable label for any channel: guild channel name, DM partner, or group DM name.
 function channelLabel(channel: any): string {
     if (!isDmChannel(channel)) return channel?.name ?? channel?.id ?? "unknown";
+    const recipients = channel.rawRecipients?.length ? channel.rawRecipients
+        : (channel.recipients ?? []).map((id: string) => UserStore.getUser(id) ?? { id });
     if (channel.type === 3) {
         if (channel.name) return channel.name;
-        const names = (channel.rawRecipients ?? []).map(recipientName).filter(Boolean);
+        const names = recipients.map(recipientName).filter(Boolean);
         return names.length ? names.join(", ") : "Group DM";
     }
-    const other = (channel.rawRecipients ?? [])[0];
+    const other = recipients[0];
     return other ? recipientName(other) : "DM";
 }
 
@@ -196,9 +207,9 @@ type RawMessage = {
 };
 
 // A crawl/export target: either a guild (all viewable text channels) or a single DM.
-type Container = { category?: string; id: string; name: string; channels: Channel[]; };
+type Container = { category?: string; id: string; name: string; channels: MessageTarget[]; discover?: boolean; };
 
-type ExportChannel = { channel: Channel; messages: RawMessage[]; error?: string; };
+type ExportChannel = { channel: MessageTarget; messages: RawMessage[]; error?: string; };
 let exporting = false;
 let cancelled = false;
 let subscribed = false;
@@ -212,7 +223,7 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const safeName = (value: string) => value.replace(/[\\/:*?"<>|]/g, "_").trim().slice(0, 80) || "server";
 const escapeHtml = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 
-function getExportableChannels(guildId: string): Channel[] {
+function getGuildParents(guildId: string): Channel[] {
     const groups = GuildChannelStore.getChannels(guildId);
     if (!groups) return [];
 
@@ -224,6 +235,9 @@ function getExportableChannels(guildId: string): Channel[] {
             if (!channel?.id || seen.has(channel.id)) return false;
             seen.add(channel.id);
             // Text, announcement and forum/media channels. Voice categories are excluded.
+            // Inclusion stays VIEW_CHANNEL based (like the previous release): a channel the account
+            // can view is always attempted, and a history-permission failure is reported instead of
+            // silently hiding the channel from the export.
             return [0, 5, 15, 16].includes(channel.type)
                 && PermissionStore.can(PermissionsBits.VIEW_CHANNEL, channel)
                 && !isLoggingBlocked(guildId, channel.id);
@@ -231,17 +245,83 @@ function getExportableChannels(guildId: string): Channel[] {
         .sort((a: any, b: any) => (a.position ?? 0) - (b.position ?? 0));
 }
 
-async function fetchAllMessages(channel: Channel, onProgress: (count: number) => void): Promise<RawMessage[]> {
+// Active threads that are neither joined nor archived are only enumerable per channel:
+// the guild-level route is bot-only, so every parent is scanned via the channel search
+// route instead. Forums and media parents are scanned every cycle; text and announcement
+// parents rotate through a bounded window so one discovery cycle cannot starve crawling.
+const ACTIVE_SCAN_WINDOW = 80;
+
+function buildActiveScan(state: Record<string, { before?: string; }>): (parent: MessageTarget) => boolean {
+    const rotatable: string[] = [];
+    const scanned = new Set<string>();
+    for (const guild of Object.values(GuildStore.getGuilds()) as Guild[]) {
+        if (isLoggingBlocked(guild.id)) continue;
+        for (const parent of getGuildParents(guild.id)) {
+            if (parent.type === 15 || parent.type === 16) scanned.add(parent.id);
+            else rotatable.push(parent.id);
+        }
+    }
+    const length = rotatable.length;
+    const parsed = Number(state.__activeScan?.before ?? "0");
+    const cursor = length && Number.isInteger(parsed) && parsed >= 0 ? parsed % length : 0;
+    for (let i = 0; i < length && i < ACTIVE_SCAN_WINDOW; i++) scanned.add(rotatable[(cursor + i) % length]);
+    const next = length ? (cursor + Math.min(length, ACTIVE_SCAN_WINDOW)) % length : 0;
+    state.__activeScan = { before: String(next) };
+    return parent => scanned.has(parent.id);
+}
+
+function canReadTarget(target: MessageTarget): boolean {
+    if (isDmChannel(target)) return true;
+    const isThread = [10, 11, 12].includes(target.type);
+    const parent = isThread && target.parent_id ? ChannelStore.getChannel(target.parent_id) : undefined;
+    if (isThread && !parent) return false;
+    const channel = ChannelStore.getChannel(target.id) ?? parent;
+    const readable = (c: Channel | undefined) => !!c
+        && PermissionStore.can(PermissionsBits.VIEW_CHANNEL, c);
+    if (!readable(channel) || (parent && !readable(parent))) return false;
+    // Parent visibility (or a prior successful GET) does not grant private membership.
+    // Re-read live state at every request/save check; unknown membership fails closed.
+    return target.type !== 12 || !!parent && (
+        PermissionStore.can(PermissionsBits.MANAGE_THREADS, parent)
+        || JoinedThreadsStore?.hasJoined?.(target.id) === true
+    );
+}
+
+async function collectGuildTargets(guildId: string, running: () => boolean, scanActive: (parent: MessageTarget) => boolean) {
+    const parents = getGuildParents(guildId);
+    return discoverGuildTargets({
+        guildId, parents,
+        cachedThreads: ChannelStore.getAllThreadsForGuild?.(guildId) ?? [],
+        scanActive,
+        canRead: canReadTarget,
+        isBlocked: target => isLoggingBlocked(guildId) || isTargetBlocked(target),
+        canManage: parent => {
+            const channel = ChannelStore.getChannel(parent.id);
+            return !!channel && PermissionStore.can(PermissionsBits.MANAGE_THREADS, channel);
+        },
+        isStopped: () => !running() || pluginStopped || authFailed || isLoggingBlocked(guildId),
+        get: (url, query) => queuedGet(url, query, () => {
+            if (!running() || isLoggingBlocked(guildId)) return false;
+            const parentId = /^\/channels\/(\d+)\//.exec(url)?.[1];
+            const parent = parentId ? ChannelStore.getChannel(parentId) : undefined;
+            if (parentId && (!parent || isTargetBlocked(parent) || !canReadTarget(parent))) return false;
+            if (parent && url.endsWith("/threads/archived/private") && !url.includes("/users/@me/")
+                && !PermissionStore.can(PermissionsBits.MANAGE_THREADS, parent)) return false;
+            return parentId ? true : parents.some(p => !isTargetBlocked(p) && canReadTarget(p));
+        })
+    });
+}
+
+function issueText(issues: DiscoveryIssue[]) {
+    return issues.map(issue => `${issue.scope}: ${issue.message}${issue.status ? ` (HTTP ${issue.status})` : ""}`).join("\n");
+}
+
+async function fetchAllMessages(channel: MessageTarget, onProgress: (count: number) => void): Promise<RawMessage[]> {
     const result: RawMessage[] = [];
     let before: string | undefined;
 
     while (!cancelled) {
-        const response = await RestAPI.get({
-            url: Constants.Endpoints.MESSAGES(channel.id),
-            query: { limit: 100, ...(before ? { before } : {}) },
-            retries: 4
-        });
-        const page = (response?.body ?? []) as RawMessage[];
+        const page = await getMessagePage(channel.id, before, () => !cancelled && !isTargetBlocked(channel) && canReadTarget(channel));
         if (!page.length) break;
         result.push(...page);
         onProgress(result.length);
@@ -258,45 +338,101 @@ function statusOf(error: any) {
 
 function retryAfterMs(error: any) {
     const raw = error?.body?.retry_after ?? error?.response?.body?.retry_after ?? error?.retry_after;
-    if (typeof raw !== "number") return 60_000;
-    return Math.max(5_000, raw < 1000 ? raw * 1000 : raw);
+    if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) return 60_000;
+    return Math.max(5_000, Math.ceil(raw * 1000));
 }
 
-async function pacedGet(channelId: string, before?: string) {
-    // One request per second. After every ten requests, add a five second rest.
-    await sleep(adaptiveDelay);
-    if (requestCount > 0 && requestCount % 10 === 0) await sleep(5_000);
-    try {
-        const response = await RestAPI.get({
-            url: Constants.Endpoints.MESSAGES(channelId),
-            query: { limit: 100, ...(before ? { before } : {}) },
-            // Handle 429 here so the crawler fully stops before retrying.
-            retries: 0
-        });
-        requestCount++;
-        adaptiveDelay = Math.max(1000, adaptiveDelay - 100);
-        return (response?.body ?? []) as RawMessage[];
-    } catch (error) {
-        if (statusOf(error) === 429) {
-            const wait = retryAfterMs(error);
-            adaptiveDelay = Math.min(10_000, Math.max(adaptiveDelay * 2, 2_000));
-            showToast(`429を検出: ${Math.ceil(wait / 1000)}秒完全停止後、${adaptiveDelay / 1000}秒間隔で再開`, Toasts.Type.FAILURE);
-            await sleep(wait + 2_000);
-            if (crawlStopped) throw error;
-            return pacedGet(channelId, before);
+// The channel thread-search endpoint answers 202 with a not-indexed notice
+// (code 110000 and retry_after in seconds) until the channel is indexed.
+function indexPendingFor(body: unknown): number | undefined {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return;
+    const candidate = body as { threads?: unknown; code?: unknown; retry_after?: unknown; };
+    if (Array.isArray(candidate.threads) || candidate.code !== 110000) return;
+    const retryAfter = candidate.retry_after;
+    return typeof retryAfter === "number" && Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter : undefined;
+}
+
+// Discovery, manual export and background history share a single request queue.
+// Keeping the 429 sleep inside this queue also respects global rate limits.
+let requestQueue: Promise<unknown> = Promise.resolve();
+let authFailed = false;
+let pluginStopped = false;
+
+function queuedGet(url: string, query: Record<string, string | number | boolean> | undefined, allowed: () => boolean): Promise<unknown> {
+    const run = async () => {
+        const check = () => {
+            if (pluginStopped || authFailed || !allowed()) throw new Error("収集を中止しました");
+        };
+        let indexRetried = false;
+        for (;;) {
+            check();
+            await sleep(Math.max(adaptiveDelay, settings.store.pageDelay || 1000));
+            if (requestCount > 0 && requestCount % 10 === 0) await sleep(5_000);
+            check();
+            requestCount++;
+            try {
+                const response = await RestAPI.get({ url, query, retries: 0 });
+                check();
+                const pending = indexRetried || !url.endsWith("/threads/search") ? undefined : indexPendingFor(response?.body);
+                if (pending !== undefined) {
+                    // One retry within this queue slot keeps global pacing and cancellation intact.
+                    indexRetried = true;
+                    await sleep(Math.min(15_000, Math.max(1_000, Math.ceil(pending * 1000))));
+                    continue;
+                }
+                adaptiveDelay = Math.max(1000, adaptiveDelay - 100);
+                return response?.body;
+            } catch (error) {
+                if (statusOf(error) === 401) {
+                    authFailed = true;
+                    showToast("認証エラー: ログ取得を停止しました。再ログイン後にプラグインを再起動してください", Toasts.Type.FAILURE);
+                }
+                if (statusOf(error) !== 429) throw error;
+                const wait = retryAfterMs(error);
+                adaptiveDelay = Math.min(10_000, Math.max(adaptiveDelay * 2, 2_000));
+                showToast(`429: ${Math.ceil(wait / 1000)}秒以上、すべてのログ取得を待機`, Toasts.Type.FAILURE);
+                // Slice very long waits to avoid setTimeout's signed-32-bit limit.
+                let remaining = wait + 2_000;
+                while (remaining > 0) {
+                    const interval = Math.min(remaining, 60_000);
+                    await sleep(interval);
+                    remaining -= interval;
+                    // A cancelled caller must not release other jobs before cooldown.
+                }
+            }
         }
-        throw error;
-    }
+    };
+    const result = requestQueue.then(run);
+    requestQueue = result.catch(() => {});
+    return result;
 }
 
-function toHistoryMessage(message: RawMessage, container: Container, channel: Channel) {
+async function getMessagePage(channelId: string, before: string | undefined, allowed: () => boolean): Promise<RawMessage[]> {
+    const body = await queuedGet(Constants.Endpoints.MESSAGES(channelId), { limit: 100, ...(before ? { before } : {}) }, allowed);
+    if (!Array.isArray(body) || body.some(m => !m || !/^\d{17,20}$/.test(m.id)))
+        throw new Error("不正なメッセージ応答");
+    return body;
+}
+
+// A gateway message normally carries an ISO timestamp. When it is missing, derive the time from
+// the snowflake instead of recording the save time, which would mislabel the message.
+function messageTimestamp(message: { id?: string; timestamp?: string; }) {
+    if (message.timestamp) return message.timestamp;
+    if (message.id && /^\d{17,20}$/.test(message.id)) {
+        try { return new Date(Number((BigInt(message.id) >> 22n) + 1420070400000n)).toISOString(); }
+        catch { /* fall through to the save time */ }
+    }
+    return new Date().toISOString();
+}
+
+function toHistoryMessage(message: RawMessage, container: Container, channel: MessageTarget) {
     return {
         guildId: container.id,
         guildName: container.name,
         channelId: channel.id,
         channelName: channelLabel(channel),
         messageId: message.id,
-        timestamp: message.timestamp || new Date().toISOString(),
+        timestamp: messageTimestamp(message),
         author: message.author?.global_name || message.author?.username || "Unknown",
         authorId: message.author?.id || "unknown",
         content: richContent(message),
@@ -309,8 +445,8 @@ function buildContainers(): Container[] {
 
     for (const guild of Object.values(GuildStore.getGuilds()) as Guild[]) {
         if (isLoggingBlocked(guild.id)) continue;
-        const channels = getExportableChannels(guild.id);
-        if (channels.length) containers.push({ id: guild.id, name: guild.name, channels });
+        const channels = getGuildParents(guild.id);
+        if (channels.length) containers.push({ id: guild.id, name: guild.name, channels, discover: true });
     }
 
     if (settings.store.crawlDms) {
@@ -328,18 +464,32 @@ async function crawlAllHistory() {
     crawlStopped = false;
     try {
         const state = await Native.loadCrawlState();
+        const running = () => !crawlStopped && !pluginStopped && !authFailed && settings.store.forceHistoryCrawl;
+        // Advance the rotation cursor for this cycle before any request can abort the run.
+        const scanActive = buildActiveScan(state);
+        await Native.saveCrawlState(state);
         for (const container of buildContainers()) {
-            for (const channel of container.channels) {
-                if (crawlStopped || !settings.store.forceHistoryCrawl) return;
+            if (!running()) return;
+            const discovery = container.discover ? await collectGuildTargets(container.id, running, scanActive) : { channels: container.channels, issues: [] };
+            if (discovery.issues.length) {
+                console.warn("[VesktopChatExporter] incomplete discovery", issueText(discovery.issues));
+                showToast(`${container.name}: スレッド一覧の一部を取得できませんでした`, Toasts.Type.FAILURE);
+            }
+            for (const channel of discovery.channels) {
+                if (!running()) return;
+                const allowed = () => running() && (!container.category || settings.store.crawlDms)
+                    && !isTargetBlocked(channel) && canReadTarget(channel);
+                if (!allowed()) continue;
                 const key = `${container.id}:${channel.id}`;
                 const saved = state[key] ?? {};
                 if (saved.completed) continue;
                 let before = saved.before;
                 while (!crawlStopped && settings.store.forceHistoryCrawl) {
                     // The channel may have been added to the stop list while this loop was running.
-                    if (isLoggingBlocked(container.category ? undefined : container.id, channel.id)) break;
+                    if (!allowed()) break;
                     try {
-                        const page = await pacedGet(channel.id, before);
+                        const page = await getMessagePage(channel.id, before, allowed);
+                        if (!allowed()) break;
                         if (!page.length) {
                             state[key] = { before, completed: true, updatedAt: new Date().toISOString() };
                             await Native.saveCrawlState(state);
@@ -353,12 +503,14 @@ async function crawlAllHistory() {
                             channelLabel(channel),
                             page.map(message => toHistoryMessage(message, container, channel))
                         );
+                        if (before && BigInt(page[page.length - 1].id) >= BigInt(before)) throw new Error("履歴カーソルが進みません");
                         before = page[page.length - 1].id; // API is newest -> oldest.
                         state[key] = { before, completed: page.length < 100, updatedAt: new Date().toISOString() };
                         await Native.saveCrawlState(state);
                         if (page.length < 100) break;
                     } catch (error) {
-                        console.error(`[VesktopChatExporter] crawl failed for ${channel.id}`, error);
+                        console.error(`[VesktopChatExporter] crawl failed for ${channel.id}`, statusOf(error) ?? "request/save failed");
+                        if (!running()) return;
                         // Non-429 errors do not spin: pause and continue with the next channel.
                         await sleep(30_000);
                         break;
@@ -366,9 +518,11 @@ async function crawlAllHistory() {
                 }
             }
         }
+    } catch (error) {
+        console.error("[VesktopChatExporter] history interrupted", statusOf(error) ?? "request/save failed");
     } finally {
         crawlRunning = false;
-        if (!crawlStopped && settings.store.forceHistoryCrawl)
+        if (!crawlStopped && !pluginStopped && !authFailed && settings.store.forceHistoryCrawl)
             crawlTimer = setTimeout(crawlAllHistory, 5 * 60_000);
     }
 }
@@ -415,15 +569,15 @@ function messageText(message: RawMessage): string {
     return lines.join("\n");
 }
 
-function makeTxt(title: string, targetId: string, channels: ExportChannel[]) {
+function makeTxt(title: string, targetId: string, channels: ExportChannel[], notice = "") {
     const body = channels.map(({ channel, messages, error }) => {
         const header = `\n\n${"=".repeat(72)}\n# ${channelLabel(channel)} (${channel.id})\n${"=".repeat(72)}`;
         return header + (error ? `\nERROR: ${error}` : `\n${messages.map(messageText).join("\n\n")}`);
     }).join("");
-    return `Discord chat export\nTarget: ${title}\nTarget ID: ${targetId}\nExported: ${new Date().toISOString()}\nChannels: ${channels.length}\nMessages: ${channels.reduce((n, c) => n + c.messages.length, 0)}${body}\n`;
+    return `Discord chat export${notice ? `\nINCOMPLETE: ${notice}` : ""}\nTarget: ${title}\nTarget ID: ${targetId}\nExported: ${new Date().toISOString()}\nChannels: ${channels.length}\nMessages: ${channels.reduce((n, c) => n + c.messages.length, 0)}${body}\n`;
 }
 
-function makeHtml(title: string, targetId: string, channels: ExportChannel[]) {
+function makeHtml(title: string, targetId: string, channels: ExportChannel[], notice = "") {
     const sections = channels.map(({ channel, messages, error }) => `<section id="c-${channel.id}"><h2># ${escapeHtml(channelLabel(channel))}</h2>${error ? `<p class="error">${escapeHtml(error)}</p>` : messages.map(m => {
         const author = m.author?.global_name || m.author?.username || "Unknown";
         const attachments = settings.store.includeAttachments ? (m.attachments ?? []).map(a => `<a class="attachment" href="${escapeHtml(a.url)}" target="_blank" rel="noreferrer">📎 ${escapeHtml(a.filename)}</a>`).join("") : "";
@@ -431,22 +585,27 @@ function makeHtml(title: string, targetId: string, channels: ExportChannel[]) {
         return `<article><div class="meta"><b>${escapeHtml(author)}</b><span>${escapeHtml(m.timestamp)}</span><code>${m.id}</code></div><div class="content">${escapeHtml(richContent(m)).replace(/\n/g, "<br>")}</div>${attachments}${embeds}</article>`;
     }).join("")}</section>`).join("");
     const nav = channels.map(c => `<a href="#c-${c.channel.id}"># ${escapeHtml(channelLabel(c.channel))}</a>`).join("");
-    return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHtml(title)} Chat Export</title><style>*{box-sizing:border-box}body{margin:0;background:#1e1f22;color:#dbdee1;font:14px system-ui,sans-serif}.layout{display:grid;grid-template-columns:260px 1fr;min-height:100vh}aside{position:sticky;top:0;height:100vh;overflow:auto;background:#2b2d31;padding:20px}aside h1{font-size:18px}aside a{display:block;color:#b5bac1;text-decoration:none;padding:7px;border-radius:5px}aside a:hover{background:#35373c;color:#fff}main{max-width:1000px;padding:28px 40px}section{margin-bottom:55px}h2{border-bottom:1px solid #3f4147;padding-bottom:12px}article{padding:10px 12px;border-radius:5px}article:hover{background:#2b2d31}.meta{display:flex;gap:10px;align-items:baseline}.meta b{color:#fff}.meta span,.meta code{font-size:11px;color:#949ba4}.content{white-space:normal;margin-top:4px;line-height:1.5}.attachment{display:block;color:#00a8fc;margin-top:5px}.error{color:#f23f42}@media(max-width:700px){.layout{display:block}aside{position:relative;height:auto}main{padding:18px}}</style></head><body><div class="layout"><aside><h1>${escapeHtml(title)}</h1><p>${channels.reduce((n,c)=>n+c.messages.length,0)} messages</p>${nav}</aside><main><h1>${escapeHtml(title)} — Chat Export</h1><p>Exported: ${escapeHtml(new Date().toISOString())}</p><p>Target ID: ${escapeHtml(targetId)}</p>${sections}</main></div></body></html>`;
+    return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHtml(title)} Chat Export</title><style>*{box-sizing:border-box}body{margin:0;background:#1e1f22;color:#dbdee1;font:14px system-ui,sans-serif}.layout{display:grid;grid-template-columns:260px 1fr;min-height:100vh}aside{position:sticky;top:0;height:100vh;overflow:auto;background:#2b2d31;padding:20px}aside h1{font-size:18px}aside a{display:block;color:#b5bac1;text-decoration:none;padding:7px;border-radius:5px}aside a:hover{background:#35373c;color:#fff}main{max-width:1000px;padding:28px 40px}section{margin-bottom:55px}h2{border-bottom:1px solid #3f4147;padding-bottom:12px}article{padding:10px 12px;border-radius:5px}article:hover{background:#2b2d31}.meta{display:flex;gap:10px;align-items:baseline}.meta b{color:#fff}.meta span,.meta code{font-size:11px;color:#949ba4}.content{white-space:normal;margin-top:4px;line-height:1.5}.attachment{display:block;color:#00a8fc;margin-top:5px}.error{color:#f23f42}@media(max-width:700px){.layout{display:block}aside{position:relative;height:auto}main{padding:18px}}</style></head><body><div class="layout"><aside><h1>${escapeHtml(title)}</h1><p>${channels.reduce((n,c)=>n+c.messages.length,0)} messages</p>${nav}</aside><main><h1>${escapeHtml(title)} — Chat Export</h1><p>Exported: ${escapeHtml(new Date().toISOString())}</p><p>Target ID: ${escapeHtml(targetId)}</p>${notice ? `<p class="error">INCOMPLETE: ${escapeHtml(notice)}</p>` : ""}${sections}</main></div></body></html>`;
 }
 
 async function exportChannels(container: Container, label: string) {
     if (exporting) return showToast("既にエクスポート中です", Toasts.Type.MESSAGE);
     exporting = true; cancelled = false;
-    const channels = container.channels;
     const output: ExportChannel[] = [];
     try {
+        const discovery = container.discover ? await collectGuildTargets(container.id, () => !cancelled, () => true)
+            : { channels: container.channels, issues: [] };
+        const { channels, issues } = discovery;
+        if (cancelled || pluginStopped || authFailed) return;
         if (!channels.length) {
+            if (issues.length) showToast(`${label}: スレッド一覧を取得できず不完全です`, Toasts.Type.FAILURE);
             showToast(isLoggingBlocked(container.id) ? `${label}: この対象は停止リストに含まれています` : `${label}: 取得できるチャンネルがありません`, Toasts.Type.FAILURE);
             return;
         }
         showToast(`${label}: ${channels.length}件の取得を開始`, Toasts.Type.MESSAGE);
         for (let i = 0; i < channels.length && !cancelled; i++) {
             const channel = channels[i];
+            if (isTargetBlocked(channel) || !canReadTarget(channel)) continue;
             const name = channelLabel(channel);
             showToast(`[${i + 1}/${channels.length}] ${name} を取得中`, Toasts.Type.MESSAGE);
             try {
@@ -455,28 +614,42 @@ async function exportChannels(container: Container, label: string) {
                 });
                 output.push({ channel, messages });
             } catch (error) {
-                output.push({ channel, messages: [], error: String(error) });
+                output.push({ channel, messages: [], error: `取得失敗 (HTTP ${statusOf(error) ?? "unknown"})` });
             }
         }
-        if (cancelled) return showToast("エクスポートを中止しました", Toasts.Type.FAILURE);
+        if (cancelled || pluginStopped || authFailed) return showToast("エクスポートを中止しました", Toasts.Type.FAILURE);
+        // Re-check after awaits: a menu opened before blocking must not bypass it.
+        const allowedOutput = output.filter(item => !isTargetBlocked(item.channel) && canReadTarget(item.channel));
+        if (!allowedOutput.length) return;
         const stamp = new Date().toISOString().replace(/[:.]/g, "-");
         const base = `${safeName(label)}_${container.id}_${stamp}`;
-        const saved = await Native.saveLogs(container.category, base, makeTxt(label, container.id, output), makeHtml(label, container.id, output));
-        showToast(`完了: ${output.reduce((n, c) => n + c.messages.length, 0)}件 / ${saved.directory}`, Toasts.Type.SUCCESS);
+        const saved = await Native.saveLogs(container.category, base, makeTxt(label, container.id, allowedOutput, issueText(issues)), makeHtml(label, container.id, allowedOutput, issueText(issues)));
+        const incomplete = issues.length > 0 || allowedOutput.some(item => item.error) || allowedOutput.length !== channels.length;
+        showToast(`${incomplete ? "一部のみ保存（不完全）" : "完了"}: ${allowedOutput.reduce((n, c) => n + c.messages.length, 0)}件 / ${saved.directory}`, incomplete ? Toasts.Type.FAILURE : Toasts.Type.SUCCESS);
+    } catch (error) {
+        showToast(`ログ保存に失敗 (HTTP ${statusOf(error) ?? "unknown"})`, Toasts.Type.FAILURE);
     } finally {
         exporting = false;
     }
 }
 
 function exportGuild(guild: Guild) {
-    return exportChannels({ id: guild.id, name: guild.name, channels: getExportableChannels(guild.id) }, guild.name);
+    return exportChannels({ id: guild.id, name: guild.name, channels: getGuildParents(guild.id), discover: true }, guild.name);
 }
 
 function exportDm(channel: Channel) {
+    if (isLoggingBlocked(undefined, channel.id)) {
+        showToast("このDMは停止リストに含まれています", Toasts.Type.FAILURE);
+        return;
+    }
     return exportChannels({ category: DM_CATEGORY, id: channel.id, name: channelLabel(channel), channels: [channel] }, channelLabel(channel));
 }
 
-async function saveLiveMessage(event: { message?: RawMessage & { channel_id?: string; guild_id?: string; }; }) {
+async function saveLiveMessage(event: { message?: RawMessage & { channel_id?: string; guild_id?: string; }; optimistic?: boolean; }) {
+    // Own sends are dispatched twice: an optimistic local echo (client-side snowflake id) and then
+    // the confirmed gateway message (server snowflake id). They carry different ids, so saving both
+    // writes every own message twice; only the confirmed message is authoritative.
+    if (event.optimistic) return;
     const message = event.message;
     if (!message?.id || savedLiveIds.has(message.id)) return;
     const channel = ChannelStore.getChannel(message.channel_id!);
@@ -490,7 +663,8 @@ async function saveLiveMessage(event: { message?: RawMessage & { channel_id?: st
 
     if (guild) {
         if (!settings.store.autoSave) return;
-        if (isLoggingBlocked(guild.id, channel.id)) return; // Blocked servers/channels stay untouched.
+        if (isLoggingBlocked(guild.id) || isTargetBlocked(channel)) return; // Parent blocks apply to threads too.
+        if (channel.type === 12 && !canReadTarget(channel)) return;
         containerId = guild.id;
         containerName = guild.name;
     } else if (isDmChannel(channel)) {
@@ -513,7 +687,7 @@ async function saveLiveMessage(event: { message?: RawMessage & { channel_id?: st
             channelId: channel.id,
             channelName: channelLabel(channel),
             messageId: message.id,
-            timestamp: message.timestamp || new Date().toISOString(),
+            timestamp: messageTimestamp(message),
             author: message.author?.global_name || message.author?.username || "Unknown",
             authorId: message.author?.id || "unknown",
             content: richContent(message),
@@ -551,9 +725,12 @@ const channelMenu: NavContextMenuPatchCallback = (children, { channel }: { chann
     );
 };
 
-const dmMenu: NavContextMenuPatchCallback = (children, { channel }: { channel?: Channel; }) => {
-    if (!isDmChannel(channel)) return;
-    const dm = channel!;
+const dmMenu: NavContextMenuPatchCallback = (children, { channel, user }: { channel?: Channel; user?: { id: string; }; }) => {
+    // User menus do not always carry a channel. Resolve an existing DM only;
+    // inspecting a menu must never create a conversation or select another DM.
+    const dmId = !channel && user && ChannelStore.getDMFromUserId(user.id);
+    const dm = channel ?? (dmId ? ChannelStore.getChannel(dmId) : undefined);
+    if (!dm || !isDmChannel(dm)) return;
     const label = channelLabel(dm);
     const blocked = parseIdList(settings.store.blockedChannelIds).includes(dm.id);
     children.push(
@@ -570,18 +747,21 @@ const dmMenu: NavContextMenuPatchCallback = (children, { channel }: { channel?: 
 
 export default definePlugin({
     name: "VesktopChatExporter",
-    description: "閲覧権限のあるサーバー内テキストチャンネルとDMをTXTとHTMLへエクスポートします",
+    description: "閲覧可能なサーバー・DM・スレッド・フォーラム投稿をTXTとHTMLへ保存します",
     authors: [{ name: "aki_0", id: 0n }],
     settings,
     contextMenus: {
         "guild-context": guildMenu,
         "guild-header-popout": guildMenu,
         "channel-context": channelMenu,
+        "thread-context": channelMenu,
         "user-context": dmMenu,
         "gdm-context": dmMenu
     },
     start() {
         if (subscribed) return;
+        pluginStopped = false;
+        authFailed = false;
         FluxDispatcher.subscribe("MESSAGE_CREATE", saveLiveMessage);
         subscribed = true;
         Native.openLogFolder().catch(() => {});
@@ -589,6 +769,8 @@ export default definePlugin({
         crawlTimer = setTimeout(crawlAllHistory, 10_000);
     },
     stop() {
+        pluginStopped = true;
+        cancelled = true;
         crawlStopped = true;
         if (crawlTimer) clearTimeout(crawlTimer);
         if (!subscribed) return;
