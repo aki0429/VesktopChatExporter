@@ -34,12 +34,14 @@ async function discover(overrides = {}) {
     return { ...result, calls };
 }
 
-test("only text and announcement parents are message targets; cached threads are normalized and deduplicated", async () => {
-    const text = parent(2), announcement = parent(3, 5), forum = parent(4, 15), media = parent(5, 16);
+test("text, announcement, voice and stage parents are message targets; cached threads are normalized and deduplicated", async () => {
+    const text = parent(2), announcement = parent(3, 5), forum = parent(4, 15), media = parent(5, 16), voice = parent(6, 2), stage = parent(7, 13);
     const cached = [thread(11, text), thread(12, announcement, 10), thread(13, forum), thread(14, media), thread(15, text, 12)];
-    const result = await discover({ parents: [text, announcement, forum, media, parent(6, 2), text], cachedThreads: [...cached, cached[0]] });
-    assert.deepEqual(ids(result), [text.id, announcement.id, ...cached.map(c => c.id)].sort());
+    const result = await discover({ parents: [text, announcement, forum, media, voice, stage, text], cachedThreads: [...cached, cached[0]] });
+    assert.deepEqual(ids(result), [text.id, announcement.id, voice.id, stage.id, ...cached.map(c => c.id)].sort());
     assert.deepEqual(plain(result.issues), []);
+    // Voice and stage text has no thread list: never searched, never archive-listed.
+    assert.deepEqual(result.calls.filter(c => c.url.includes(voice.id) || c.url.includes(stage.id)), []);
     assert.deepEqual(plain(result.channels.find(c => c.id === cached[0].id)), {
         id: cached[0].id, type: 11, guild_id: guildId, parent_id: text.id, name: cached[0].name
     }, "REST/cache entries become MessageTarget values, not Channel instances or raw metadata");

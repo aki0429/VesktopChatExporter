@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { loadPlugin, id } from "./harness.mjs";
+import { exportDiscarded, exportJson, exportStarted, loadPlugin, id } from "./harness.mjs";
 
 test("manual export retries a 429 through the shared paced request path", async () => {
     const dm = { id: id(1), type: 1 };
@@ -22,7 +22,8 @@ test("DM blocked while the response is in flight is not persisted", async () => 
         return { body: [{ id: id(20), timestamp: "2026-01-01T00:00:00Z" }] };
     } });
     await app.hooks.exportDm(dm);
-    assert.equal(app.saved.length, 0);
+    assert.equal(exportJson(app), "", "no message may be persisted");
+    assert.ok(!exportStarted(app) || exportDiscarded(app), "a run without messages leaves nothing behind");
 });
 
 test("stopping the plugin during an export discards in-flight output", async () => {
@@ -32,7 +33,8 @@ test("stopping the plugin during an export discards in-flight output", async () 
         return { body: [] };
     } });
     await app.hooks.exportDm(dm);
-    assert.equal(app.saved.length, 0);
+    assert.equal(exportJson(app), "", "no message may be persisted");
+    assert.ok(!exportStarted(app) || exportDiscarded(app), "a run without messages leaves nothing behind");
 });
 
 test("unauthorized response stops all collection and does not report a successful export", async () => {
@@ -41,7 +43,8 @@ test("unauthorized response stops all collection and does not report a successfu
     await app.hooks.exportDm(dm);
     await app.hooks.exportDm(dm);
     assert.equal(app.requests.length, 1);
-    assert.equal(app.saved.length, 0);
+    assert.equal(exportJson(app), "", "no message may be persisted");
+    assert.ok(!exportStarted(app) || exportDiscarded(app), "a run without messages leaves nothing behind");
     assert.ok(!app.toasts.some(t => t[1] === "success"));
 });
 

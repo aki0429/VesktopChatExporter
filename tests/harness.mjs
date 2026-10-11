@@ -35,11 +35,85 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
         FluxDispatcher: { subscribe() {}, unsubscribe() {} },
         showToast: (...args) => toasts.push(args), Toasts: { Type: { MESSAGE: "message", SUCCESS: "success", FAILURE: "failure" } }
     };
+    // An in-memory disk: helpers write into it exactly like the native side does on real files, so
+    // tests can read back what a run actually stored instead of one final buffered value.
+    const files = new Map();
+    const pages = new Map();
+    const dirOf = category => `fixture/${category ?? "logs"}`;
+    const pageStore = (category, baseName, channelId) => {
+        const key = `${category ?? ""}|${baseName}|${channelId}`;
+        if (!pages.has(key)) pages.set(key, new Map());
+        return pages.get(key);
+    };
+    const append = (file, text) => { files.set(file, (files.get(file) ?? "") + text); };
+    const byId = (left, right) => left < right ? -1 : left > right ? 1 : 0;
     const helpers = {
         loadCrawlState: async () => ({}), saveCrawlState: async () => {},
         saveLogs: async (...args) => { saved.push({ kind: "export", args }); return { directory: "fixture" }; },
         appendLiveMessage: async (...args) => { saved.push({ kind: "live", args }); },
-        saveHistoryPage: async (...args) => { saved.push({ kind: "history", args }); },
+        // The background crawler stores one finished page per call, like the native side.
+        saveHistoryPage: async (category, guildId, guildName, channelId, channelName, messages) => {
+            saved.push({ kind: "history", channelId, args: [category, guildId, guildName, channelId, channelName, messages] });
+            const base = `${messages[0].messageId}_${messages[messages.length - 1].messageId}`;
+            pageStore(category, guildId, channelId).set(base, messages);
+            return { directory: dirOf(category), count: messages.length };
+        },
+        // Streaming export: one file per run, opened up front and appended page by page.
+        beginExport: async (category, baseName, manifest, txtHeader, htmlHeader) => {
+            files.set(`${dirOf(category)}/${baseName}.manifest.json`, manifest);
+            files.set(`${dirOf(category)}/${baseName}.txt`, txtHeader);
+            files.set(`${dirOf(category)}/${baseName}.html`, htmlHeader);
+            saved.push({ kind: "export-begin", args: [category, baseName, manifest, txtHeader, htmlHeader] });
+            return {
+                directory: dirOf(category), base: baseName,
+                txtPath: `${dirOf(category)}/${baseName}.txt`,
+                htmlPath: `${dirOf(category)}/${baseName}.html`,
+                manifestPath: `${dirOf(category)}/${baseName}.manifest.json`
+            };
+        },
+        appendExport: async (category, baseName, fragment) => {
+            saved.push({ kind: "export", args: [category, baseName, fragment] });
+            if (fragment.txt) append(`${dirOf(category)}/${baseName}.txt`, fragment.txt);
+            if (fragment.html) append(`${dirOf(category)}/${baseName}.html`, fragment.html);
+            return { written: (fragment.txt ? 1 : 0) + (fragment.html ? 1 : 0) };
+        },
+        finishExport: async (category, baseName, summary, txtFooter, htmlFooter) => {
+            saved.push({ kind: "export-finish", args: [category, baseName, txtFooter, htmlFooter] });
+            append(`${dirOf(category)}/${baseName}.txt`, txtFooter);
+            append(`${dirOf(category)}/${baseName}.html`, htmlFooter);
+            append(`${dirOf(category)}/${baseName}.manifest.json`, `\n${summary}`);
+            return { directory: dirOf(category), bytes: { txt: 1, html: 1, manifest: 1 } };
+        },
+        discardExport: async (category, baseName) => {
+            saved.push({ kind: "export-discard", args: [category, baseName] });
+            for (const name of [`${baseName}.txt`, `${baseName}.html`, `${baseName}.manifest.json`])
+                files.delete(`${dirOf(category)}/${name}`);
+            return { removed: 3 };
+        },
+        // Per-page JSON: stored the moment a page arrives, read back to assemble the aggregate.
+        writeHistoryPageJson: async (category, baseName, channelId, channelName, messages) => {
+            if (!messages.length) return null;
+            const ordered = [...messages].sort((left, right) => byId(left.messageId, right.messageId));
+            const base = `${ordered[0].messageId}_${ordered[ordered.length - 1].messageId}`;
+            pageStore(category, baseName, channelId).set(base, ordered);
+            saved.push({ kind: "history", channelId, args: [category, baseName, channelId, channelName, messages] });
+            const file = `${dirOf(category)}/${baseName}.parts/${channelId}_${channelName}/${base}.jsonl`;
+            files.set(file, `${ordered.map(message => JSON.stringify(message)).join("\n")}\n`);
+            return { base, path: file, count: ordered.length };
+        },
+        listHistoryPages: async (category, baseName, channelId, channelName) =>
+            [...pageStore(category, baseName, channelId).keys()].sort((left, right) => byId(left.split("_")[0], right.split("_")[0])),
+        readHistoryPage: async (category, baseName, channelId, channelName, base) =>
+            pageStore(category, baseName, channelId).get(base) ?? [],
+        discardHistoryPages: async (category, baseName, channelId, channelName, bases) => {
+            saved.push({ kind: "history-discard", channelId, args: [category, baseName, channelId, channelName, bases] });
+            const store = pageStore(category, baseName, channelId);
+            for (const base of bases) {
+                store.delete(base);
+                files.delete(`${dirOf(category)}/${baseName}.parts/${channelId}_${channelName}/${base}.jsonl`);
+            }
+            return { removed: bases.length };
+        },
         openLogFolder: async () => "fixture", ...native
     };
     const imports = {
@@ -53,7 +127,7 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
         "@webpack/common": common
     };
     const code = buildSync({
-        stdin: { contents: readFileSync(filename, "utf8") + "\nexport const testHooks = { getDmChannels, channelLabel, buildActiveScan, buildContainers, crawlAllHistory, exportGuild, exportDm, saveLiveMessage, retryAfterMs };", loader: "tsx", resolveDir: path.dirname(filename) },
+        stdin: { contents: readFileSync(filename, "utf8") + "\nexport const testHooks = { getDmChannels, channelLabel, buildActiveScan, buildContainers, crawlAllHistory, exportGuild, exportDm, saveLiveMessage, retryAfterMs, getGuildParents, nextDelay, baseDelay, DELAY_FLOOR, DELAY_CEILING };", loader: "tsx", resolveDir: path.dirname(filename) },
         bundle: true, write: false, platform: "node", format: "cjs", external: ["@api/*", "@utils/*", "@webpack/*", "@vencord/*"],
         jsxFactory: "React.createElement"
     }).outputFiles[0].text;
@@ -69,9 +143,21 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
         setTimeout: (fn, ms) => { waits.push(ms); if (fn.name !== "crawlAllHistory") queueMicrotask(fn); return 1; }, clearTimeout() {},
     };
     vm.runInNewContext(code, context, { filename });
-    return { plugin: context.module.exports.default, hooks: context.module.exports.testHooks, requests, saved, toasts, errors, waits, store, channelMap };
+    return { plugin: context.module.exports.default, hooks: context.module.exports.testHooks, requests, saved, toasts, errors, waits, store, channelMap, files, pages };
 }
 
 export const id = n => `100000000000000${String(n).padStart(3, "0")}`;
 export const message = n => ({ id: id(n), content: `fixture message ${n}`, timestamp: "2026-01-01T00:00:00.000Z", author: { id: id(999), username: "fixture" } });
 export const items = children => children.filter(x => x?.type === "item");
+
+// Streaming export helpers: a run writes into its own files, so tests read what it really stored
+// (and in which order) instead of a single buffered save.
+export const exportFiles = app => app.files;
+export const exportWrites = app => app.saved.filter(s => s.kind === "export");
+export const exportStarted = app => app.saved.some(s => s.kind === "export-begin");
+export const exportFinished = app => app.saved.some(s => s.kind === "export-finish");
+export const exportDiscarded = app => app.saved.some(s => s.kind === "export-discard");
+const exportFile = (app, extension) => [...app.files].filter(([file]) => file.endsWith(extension)).map(([, text]) => text).join("\n");
+export const exportText = app => exportFile(app, ".txt");
+export const exportHtml = app => exportFile(app, ".html");
+export const exportJson = app => exportFile(app, ".jsonl");

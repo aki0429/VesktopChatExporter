@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { loadPlugin, id, message } from "./harness.mjs";
+import { exportHtml, exportJson, exportStarted, exportText, loadPlugin, id, message } from "./harness.mjs";
 
 const guild = { id: id(100), name: "Private thread fixture" };
 const parent = { id: id(1), type: 0, name: "parent", guild_id: guild.id };
@@ -17,22 +17,26 @@ const archiveResponse = url => ({ body: {
 } });
 
 function assertPrivateNotSaved(app) {
+    assert.ok(!exportText(app).includes(privateContent), "TXT must discard revoked private history");
+    assert.ok(!exportHtml(app).includes(privateContent), "HTML must discard revoked private history");
+    assert.ok(!exportJson(app).includes(privateContent), "JSONL must discard revoked private history");
+    // A page fetched just before access was revoked may be written and then deleted again, but it
+    // must never survive the run: no record of it and no part file on disk.
     for (const saved of app.saved) {
-        if (saved.kind === "export") {
-            assert.ok(!saved.args[2].includes(privateContent), "TXT must discard revoked private history");
-            assert.ok(!saved.args[3].includes(privateContent), "HTML must discard revoked private history");
-        } else if (saved.kind === "history") {
-            assert.notEqual(saved.args[3], privateThread.id, "crawler must not save revoked private history");
-        }
+        if (saved.kind === "history" && saved.channelId === privateThread.id)
+            assert.ok(app.saved.some(entry => entry.kind === "history-discard" && entry.channelId === privateThread.id),
+                "a page written for the revoked private thread must be deleted again");
     }
+    for (const [file] of app.files)
+        assert.ok(!file.includes(privateThread.id), "no part file may survive for the revoked private thread");
 }
 
 function assertPrivateSaved(app, mode) {
     if (mode === "manual") {
-        const saved = app.saved.find(s => s.kind === "export");
-        assert.ok(saved, "export must be persisted");
-        assert.ok(saved.args[2].includes(privateContent), "TXT retains currently authorized private history");
-        assert.ok(saved.args[3].includes(privateContent), "HTML retains currently authorized private history");
+        assert.ok(exportStarted(app), "export must be persisted");
+        assert.ok(exportText(app).includes(privateContent), "TXT retains currently authorized private history");
+        assert.ok(exportHtml(app).includes(privateContent), "HTML retains currently authorized private history");
+        assert.ok(exportJson(app).includes(privateContent), "JSONL retains currently authorized private history");
     } else {
         const saved = app.saved.find(s => s.kind === "history" && s.args[3] === privateThread.id);
         assert.ok(saved, "crawler retains currently authorized private history");
@@ -115,8 +119,8 @@ for (const cached of [false, true]) {
             assert.ok(fetchedPrivate);
             assert.ok(app.requests.some(r => r.url === `/channels/${post.id}/messages`));
             assertPrivateNotSaved(app);
-            assert.equal(app.saved.length, 1, "still save accessible public data");
-            assert.ok(app.saved[0].args[2].includes("later post"));
+            assert.ok(exportStarted(app), "still save accessible public data");
+            assert.ok(exportText(app).includes("later post"));
             assert.ok(!app.toasts.some(t => t[1] === "success"));
         });
     }
@@ -287,7 +291,7 @@ test("joined archive with unknown current membership fails closed and reports in
     assert.ok(app.requests.some(r => r.url.includes("/users/@me/threads/archived/private")));
     assert.ok(!app.requests.some(r => r.url === privateUrl));
     assertPrivateNotSaved(app);
-    assert.equal(app.saved.length, 1, "accessible parent is still exported");
-    assert.match(app.saved[0].args[2], /INCOMPLETE/);
+    assert.ok(exportStarted(app), "accessible parent is still exported");
+    assert.match(exportText(app), /INCOMPLETE/);
     assert.ok(!app.toasts.some(t => t[1] === "success"));
 });

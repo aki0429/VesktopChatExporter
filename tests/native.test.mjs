@@ -11,6 +11,19 @@ import { id } from "./harness.mjs";
 const require = createRequire(import.meta.url);
 const source = fileURLToPath(new URL("../src/plugins/vesktopChatExporter/native.ts", import.meta.url));
 
+async function loadNative(dir) {
+    const code = buildSync({ entryPoints: [source], bundle: true, write: false, format: "cjs", platform: "node", external: ["electron"] }).outputFiles[0].text;
+    const context = { module: { exports: {} }, require: name => name === "electron" ? { app: { getPath: () => dir }, shell: { openPath: async () => "" } } : require(name) };
+    vm.runInNewContext(code, context);
+    return context.module.exports;
+}
+
+const part = (channelId, n, channelName = "chrono") => ({
+    guildId: id(3), guildName: "Fixture", channelId, channelName,
+    messageId: id(n), timestamp: `2026-01-01T00:00:${String(n).padStart(2, "0")}.000Z`,
+    author: "fixture", authorId: id(21), content: `chrono ${n}`, attachments: []
+});
+
 test("history chunks are stored oldest-first so the archive reads chronologically", async () => {
     const scratch = process.env.TMPDIR;
     assert.ok(scratch, "TMPDIR must point to the test scratch directory");
@@ -68,6 +81,59 @@ test("real native writer saves DM, group DM and forum/thread TXT/HTML in isolate
             assert.equal(files.length, 2);
             assert.ok(history.directory.includes(category === "DMs" ? `${path.sep}DMs${path.sep}` : `${path.sep}Fixture_${guildId}${path.sep}`));
         }
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("per-page JSON parts are written as each page arrives, listed oldest-first and removable again", async () => {
+    const scratch = process.env.TMPDIR;
+    assert.ok(scratch, "TMPDIR must point to the test scratch directory");
+    const dir = await mkdtemp(path.join(scratch, "vesktop-parts-test-"));
+    try {
+        const native = await loadNative(dir);
+        const run = "Fixture_100_2026-01-01T00-00-00-000Z";
+        const channel = id(5);
+        // The API answers newest -> oldest; both pages must be stored oldest-first.
+        const first = await native.writeHistoryPageJson(null, undefined, run, channel, "chrono", [part(channel, 12), part(channel, 11), part(channel, 10)]);
+        const second = await native.writeHistoryPageJson(null, undefined, run, channel, "chrono", [part(channel, 22), part(channel, 21), part(channel, 20)]);
+
+        assert.equal(first.base, `${id(10)}_${id(12)}`);
+        assert.match(first.path, /\.parts/);
+        const lines = (await readFile(first.path, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+        assert.deepEqual(lines.map(message => message.messageId), [id(10), id(11), id(12)]);
+
+        // Spread the arrays: values built inside the plugin's realm are not reference-equal.
+        assert.deepEqual([...await native.listHistoryPages(null, undefined, run, channel, "chrono")], [`${id(10)}_${id(12)}`, `${id(20)}_${id(22)}`]);
+        assert.deepEqual([...(await native.readHistoryPage(null, undefined, run, channel, "chrono", second.base)).map(message => message.messageId)], [id(20), id(21), id(22)]);
+
+        assert.equal((await native.discardHistoryPages(null, undefined, run, channel, "chrono", [first.base])).removed, 1);
+        assert.deepEqual([...await native.listHistoryPages(null, undefined, run, channel, "chrono")], [second.base]);
+        // A page that was never written, and a traversal attempt, are both refused.
+        await assert.rejects(() => native.readHistoryPage(null, undefined, run, channel, "chrono", "../../secret"));
+        assert.equal((await native.discardHistoryPages(null, undefined, run, channel, "chrono", ["../../secret"])).removed, 0);
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("the aggregate is opened once, appended page by page and closed with a manifest", async () => {
+    const scratch = process.env.TMPDIR;
+    assert.ok(scratch, "TMPDIR must point to the test scratch directory");
+    const dir = await mkdtemp(path.join(scratch, "vesktop-stream-test-"));
+    try {
+        const native = await loadNative(dir);
+        const run = "Fixture_100_stream";
+        const opened = await native.beginExport(null, undefined, run, "{\"tool\":\"fixture\"}\n", "HEADER\n", "<html>HEAD");
+        assert.match(opened.partsDir, /\.parts$/);
+        await native.appendExport(null, undefined, run, { txt: "page one\n", html: "<article>1</article>" });
+        await native.appendExport(null, undefined, run, { txt: "page two\n" });
+        const done = await native.finishExport(null, undefined, run, "{\"outcome\":\"complete\"}", "FOOTER\n", "</html>");
+
+        assert.equal(await readFile(opened.txtPath, "utf8"), "HEADER\npage one\npage two\nFOOTER\n");
+        assert.equal(await readFile(opened.htmlPath, "utf8"), "<html>HEAD<article>1</article></html>");
+        assert.match(await readFile(opened.manifestPath, "utf8"), /"outcome":"complete"/);
+        assert.ok(done.bytes.txt > 0 && done.bytes.manifest > 0);
     } finally {
         await rm(dir, { recursive: true, force: true });
     }

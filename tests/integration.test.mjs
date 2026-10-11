@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { loadPlugin, id, message } from "./harness.mjs";
+import { exportStarted, exportText, loadPlugin, id, message } from "./harness.mjs";
 
 const guild = { id: id(100), name: "Fixture guild" };
 const text = { id: id(1), type: 0, name: "text", guild_id: guild.id };
@@ -17,6 +17,40 @@ test("text permissions are checked on the channel, not its category parent", asy
     assert.ok(app.requests.some(r => r.url === `/channels/${text.id}/messages`));
 });
 
+const voice = { id: id(40), type: 2, name: "voice", guild_id: guild.id };
+const stage = { id: id(41), type: 13, name: "stage", guild_id: guild.id };
+
+test("full-channel export includes voice and stage channel text", async () => {
+    const app = loadPlugin({ channels: [text, voice, stage], guilds: [guild], rest: fixtureRest });
+    await app.hooks.exportGuild(guild);
+    const messageUrls = app.requests.filter(r => r.url.endsWith("/messages")).map(r => r.url);
+    assert.ok(messageUrls.includes(`/channels/${voice.id}/messages`), "voice channel text must be exported");
+    assert.ok(messageUrls.includes(`/channels/${stage.id}/messages`), "stage channel text must be exported");
+    // Voice/stage channels carry no threads, so discovery must not query them for threads.
+    assert.ok(!app.requests.some(r => r.url === `/channels/${voice.id}/threads/search`));
+    assert.ok(!app.requests.some(r => r.url === `/channels/${stage.id}/threads/search`));
+});
+
+test("a voice channel the account cannot view stays out of the export", async () => {
+    const app = loadPlugin({
+        channels: [text, voice], guilds: [guild],
+        can: (bit, channel) => channel.id !== voice.id,
+        rest: fixtureRest
+    });
+    assert.deepEqual([...app.hooks.getGuildParents(guild.id).map(c => c.id)], [text.id]);
+    await app.hooks.exportGuild(guild);
+    assert.ok(!app.requests.some(r => r.url === `/channels/${voice.id}/messages`));
+    assert.ok(app.requests.some(r => r.url === `/channels/${text.id}/messages`));
+});
+
+test("the existing guild menu keeps its name", () => {
+    const app = loadPlugin({ channels: [text, voice], guilds: [guild] });
+    const children = [];
+    app.plugin.contextMenus["guild-context"](children, { guild });
+    const exportItem = children.find(c => c?.props?.id === "vc-export-guild-chat");
+    assert.equal(exportItem.props.label, "全チャンネルのログを保存（TXT + HTML）");
+});
+
 test("thread context supports the same stop list menu as guild channels", () => {
     const app = loadPlugin({ channels: [text, thread], guilds: [guild] });
     const menu = app.plugin.contextMenus["thread-context"];
@@ -30,9 +64,9 @@ test("guild export saves active threads and archived forum posts instead of foru
     const app = loadPlugin({ channels: [text, forum], guilds: [guild], rest: fixtureRest });
     await app.hooks.exportGuild(guild);
     assert.deepEqual(app.requests.filter(r => r.url.endsWith("/messages")).map(r => r.url).sort(), [text, post, thread].map(c => `/channels/${c.id}/messages`).sort());
-    assert.equal(app.saved.length, 1);
-    assert.match(app.saved[0].args[2], /post/);
-    assert.match(app.saved[0].args[3], /thread/);
+    assert.ok(exportStarted(app), "the run must open its export files");
+    assert.match(exportText(app), /post/);
+    assert.match(exportText(app), /thread/);
 });
 
 test("crawler records forum post history, never marks a forum parent complete", async () => {
@@ -50,7 +84,7 @@ test("withheld history permission does not silently drop a viewable channel", as
     const app = loadPlugin({ channels: [text, forum], guilds: [guild], can: bit => bit === 1n, rest: fixtureRest });
     await app.hooks.exportGuild(guild);
     assert.ok(app.requests.some(r => r.url === `/channels/${text.id}/messages`), "viewable channels must still be exported");
-    assert.ok(app.saved.length > 0, "the export must still be written");
+    assert.ok(exportStarted(app), "the export must still be written");
 });
 
 test("parent blocked during discovery cannot leak its post to export", async () => {
@@ -71,7 +105,7 @@ test("discovery errors show an incomplete export instead of a success toast", as
     await app.hooks.exportGuild(guild);
     assert.ok(!app.toasts.some(t => t[1] === "success"));
     assert.ok(app.toasts.some(t => /一部|不完全/.test(t[0])));
-    assert.match(app.saved[0].args[2], /403/);
+    assert.match(exportText(app), /403/);
 });
 
 test("background crawler rotates a bounded window of text parents while forums scan every cycle", () => {

@@ -44,6 +44,11 @@ const settings = definePluginSettings({
         type: OptionType.NUMBER,
         default: 750
     },
+    adaptivePacing: {
+        description: "取得速度を自動調節する（429・失敗時は自動で減速し、成功が続くと徐々に加速。上の間隔を下限として使います）",
+        type: OptionType.BOOLEAN,
+        default: true
+    },
     autoSave: {
         description: "受信したサーバーメッセージを専用フォルダーへ自動追記する（起動中のみ）",
         type: OptionType.BOOLEAN,
@@ -219,7 +224,30 @@ let crawlTimer: ReturnType<typeof setTimeout> | undefined;
 let requestCount = 0;
 let adaptiveDelay = 1000;
 const savedLiveIds = new Set<string>();
+// Adaptive pacing: the configured interval is the floor. The controller slows down on 429s and
+// request failures, then speeds back up after a run of successes so a full history crawl finds a
+// rate the account can sustain instead of hammering Discord at a fixed speed.
+const DELAY_FLOOR = 500;
+const DELAY_CEILING = 10_000;
+
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+function baseDelay() {
+    return Math.max(DELAY_FLOOR, settings.store.pageDelay || 1000);
+}
+
+// Pure pacing decision so it can be unit tested. Never returns less than the floor.
+export function nextDelay(current: number, event: "ok" | "throttled" | "error", floor = DELAY_FLOOR, ceiling = DELAY_CEILING) {
+    if (event === "throttled") return Math.min(ceiling, Math.max(current * 2, 2_000));
+    if (event === "error") return Math.min(ceiling, Math.max(current * 1.5, floor));
+    return Math.max(floor, current - Math.max(50, Math.round(current * 0.1)));
+}
+
+function pacedDelay() {
+    if (!settings.store.adaptivePacing) return baseDelay();
+    adaptiveDelay = Math.min(DELAY_CEILING, Math.max(baseDelay(), adaptiveDelay));
+    return adaptiveDelay;
+}
 const safeName = (value: string) => value.replace(/[\\/:*?"<>|]/g, "_").trim().slice(0, 80) || "server";
 const escapeHtml = (value: unknown) => String(value ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]!));
 
@@ -234,11 +262,12 @@ function getGuildParents(guildId: string): Channel[] {
         .filter((channel: Channel & { type: number; }) => {
             if (!channel?.id || seen.has(channel.id)) return false;
             seen.add(channel.id);
-            // Text, announcement and forum/media channels. Voice categories are excluded.
+            // Text, announcement, forum/media and voice/stage text channels. Voice and stage
+            // channels carry their own text chat and belong to "全チャンネルのログを保存".
             // Inclusion stays VIEW_CHANNEL based (like the previous release): a channel the account
             // can view is always attempted, and a history-permission failure is reported instead of
             // silently hiding the channel from the export.
-            return [0, 5, 15, 16].includes(channel.type)
+            return [0, 2, 5, 13, 15, 16].includes(channel.type)
                 && PermissionStore.can(PermissionsBits.VIEW_CHANNEL, channel)
                 && !isLoggingBlocked(guildId, channel.id);
         })
@@ -316,20 +345,34 @@ function issueText(issues: DiscoveryIssue[]) {
     return issues.map(issue => `${issue.scope}: ${issue.message}${issue.status ? ` (HTTP ${issue.status})` : ""}`).join("\n");
 }
 
-async function fetchAllMessages(channel: MessageTarget, onProgress: (count: number) => void): Promise<RawMessage[]> {
-    const result: RawMessage[] = [];
-    let before: string | undefined;
+// Snowflake ids order messages by time; compare them as numbers instead of trusting the API order.
+function compareIds(left: string, right: string) {
+    const numeric = /^\d{17,20}$/;
+    if (numeric.test(left) && numeric.test(right) && left.length !== right.length)
+        return left.length < right.length ? -1 : 1;
+    return left < right ? -1 : left > right ? 1 : 0;
+}
 
-    while (!cancelled) {
-        const page = await getMessagePage(channel.id, before, () => !cancelled && !isTargetBlocked(channel) && canReadTarget(channel));
-        if (!page.length) break;
-        result.push(...page);
-        onProgress(result.length);
-        if (page.length < 100) break;
-        before = page[page.length - 1].id;
-        await sleep(Math.max(500, settings.store.pageDelay));
+// Walks a channel's history page by page, newest -> oldest, handing each page to the caller while it
+// is the only page in memory: a channel with hundreds of thousands of messages never has to fit in
+// RAM and every page is on disk before the next request goes out. The cursor must move back every
+// round; a page that does not move it stops the loop instead of spinning.
+async function walkChannelHistory(channel: MessageTarget, allowed: () => boolean, onPage: (page: RawMessage[]) => Promise<void>) {
+    let before: string | undefined;
+    for (;;) {
+        if (cancelled) return;
+        const page = await getMessagePage(channel.id, { before }, () => !cancelled && allowed());
+        if (!page.length) return;
+        // Re-check after the response: a channel whose access was revoked while the request was in
+        // flight must never reach storage.
+        if (!allowed()) throw new Error("閲覧権限が取り消されたため中止しました");
+        const ordered = [...page].sort((left, right) => compareIds(left.id, right.id));
+        const oldest = ordered[0].id;
+        if (before && compareIds(oldest, before) >= 0) throw new Error("履歴カーソルが進みません");
+        await onPage(ordered);
+        before = oldest;
+        if (page.length < 100) return;
     }
-    return result.reverse();
 }
 
 function statusOf(error: any) {
@@ -366,7 +409,7 @@ function queuedGet(url: string, query: Record<string, string | number | boolean>
         let indexRetried = false;
         for (;;) {
             check();
-            await sleep(Math.max(adaptiveDelay, settings.store.pageDelay || 1000));
+            await sleep(pacedDelay());
             if (requestCount > 0 && requestCount % 10 === 0) await sleep(5_000);
             check();
             requestCount++;
@@ -380,7 +423,7 @@ function queuedGet(url: string, query: Record<string, string | number | boolean>
                     await sleep(Math.min(15_000, Math.max(1_000, Math.ceil(pending * 1000))));
                     continue;
                 }
-                adaptiveDelay = Math.max(1000, adaptiveDelay - 100);
+                adaptiveDelay = nextDelay(adaptiveDelay, "ok", baseDelay());
                 return response?.body;
             } catch (error) {
                 if (statusOf(error) === 401) {
@@ -389,7 +432,7 @@ function queuedGet(url: string, query: Record<string, string | number | boolean>
                 }
                 if (statusOf(error) !== 429) throw error;
                 const wait = retryAfterMs(error);
-                adaptiveDelay = Math.min(10_000, Math.max(adaptiveDelay * 2, 2_000));
+                adaptiveDelay = nextDelay(adaptiveDelay, "throttled", baseDelay());
                 showToast(`429: ${Math.ceil(wait / 1000)}秒以上、すべてのログ取得を待機`, Toasts.Type.FAILURE);
                 // Slice very long waits to avoid setTimeout's signed-32-bit limit.
                 let remaining = wait + 2_000;
@@ -407,8 +450,9 @@ function queuedGet(url: string, query: Record<string, string | number | boolean>
     return result;
 }
 
-async function getMessagePage(channelId: string, before: string | undefined, allowed: () => boolean): Promise<RawMessage[]> {
-    const body = await queuedGet(Constants.Endpoints.MESSAGES(channelId), { limit: 100, ...(before ? { before } : {}) }, allowed);
+async function getMessagePage(channelId: string, cursor: { before?: string; after?: string; }, allowed: () => boolean): Promise<RawMessage[]> {
+    const query = { limit: 100, ...(cursor.before ? { before: cursor.before } : {}), ...(cursor.after ? { after: cursor.after } : {}) };
+    const body = await queuedGet(Constants.Endpoints.MESSAGES(channelId), query, allowed);
     if (!Array.isArray(body) || body.some(m => !m || !/^\d{17,20}$/.test(m.id)))
         throw new Error("不正なメッセージ応答");
     return body;
@@ -488,7 +532,7 @@ async function crawlAllHistory() {
                     // The channel may have been added to the stop list while this loop was running.
                     if (!allowed()) break;
                     try {
-                        const page = await getMessagePage(channel.id, before, allowed);
+                        const page = await getMessagePage(channel.id, { before }, allowed);
                         if (!allowed()) break;
                         if (!page.length) {
                             state[key] = { before, completed: true, updatedAt: new Date().toISOString() };
@@ -559,39 +603,73 @@ function richContent(message: RawMessage): string {
     return lines.join("\n");
 }
 
-function messageText(message: RawMessage): string {
-    const author = message.author?.global_name || message.author?.username || "Unknown";
-    const lines = [`[${message.timestamp}] ${author} (${message.author?.id ?? "?"})${message.author?.bot ? " [BOT]" : ""}`, richContent(message)];
-    if (settings.store.includeAttachments) {
+// Streaming export helpers. The aggregate files are opened up front and then filled page by page
+// from the per-page JSON files on disk, so memory stays flat no matter how large the server is and
+// a crash keeps every page already written. The per-page .jsonl files are the canonical,
+// re-parseable record and the .manifest.json file describes the run.
+const EXPORT_CSS = `*{box-sizing:border-box}body{margin:0;background:#1e1f22;color:#dbdee1;font:14px system-ui,sans-serif}.layout{display:grid;grid-template-columns:260px 1fr;min-height:100vh}aside{position:sticky;top:0;height:100vh;overflow:auto;background:#2b2d31;padding:20px}aside h1{font-size:18px}aside a{display:block;color:#b5bac1;text-decoration:none;padding:7px;border-radius:5px}aside a:hover{background:#35373c;color:#fff}main{max-width:1000px;padding:28px 40px}section{margin-bottom:55px}h2{border-bottom:1px solid #3f4147;padding-bottom:12px}article{padding:10px 12px;border-radius:5px}article:hover{background:#2b2d31}.meta{display:flex;gap:10px;align-items:baseline}.meta b{color:#fff}.meta span,.meta code{font-size:11px;color:#949ba4}.content{white-space:normal;margin-top:4px;line-height:1.5}.attachment{display:block;color:#00a8fc;margin-top:5px}.error{color:#f23f42}@media(max-width:700px){.layout{display:block}aside{position:relative;height:auto}main{padding:18px}}`;
+
+function exportTxtHeader(title: string, targetId: string, channels: MessageTarget[]) {
+    return `Discord chat export\nTarget: ${title}\nTarget ID: ${targetId}\nExported: ${new Date().toISOString()}\nChannels: ${channels.length}\n`;
+}
+
+function exportTxtFooter(total: number, savedChannels: number, notice: string) {
+    return `${notice ? `INCOMPLETE: ${notice}\n` : ""}Messages: ${total}\nSaved channels: ${savedChannels}\n`;
+}
+
+function channelTxtHeader(channel: MessageTarget) {
+    return `\n\n${"=".repeat(72)}\n# ${channelLabel(channel)} (${channel.id})\n${"=".repeat(72)}\n`;
+}
+
+// The aggregate is assembled from the records that were actually written to disk, so what a run
+// reports is exactly what it stored. Each record carries the rendered content (embeds, stickers,
+// polls and components included) plus attachment names and URLs.
+type StoredMessage = {
+    messageId: string;
+    timestamp: string;
+    author: string;
+    authorId: string;
+    content: string;
+    attachments?: { filename: string; url: string; }[];
+};
+
+function storedMessageText(message: StoredMessage) {
+    const lines = [`[${message.timestamp}] ${message.author} (${message.authorId})`, message.content];
+    if (settings.store.includeAttachments)
         for (const file of message.attachments ?? []) lines.push(`[添付] ${file.filename}: ${file.url}`);
-    }
-    if (message.edited_timestamp) lines.push(`[編集: ${message.edited_timestamp}]`);
     return lines.join("\n");
 }
 
-function makeTxt(title: string, targetId: string, channels: ExportChannel[], notice = "") {
-    const body = channels.map(({ channel, messages, error }) => {
-        const header = `\n\n${"=".repeat(72)}\n# ${channelLabel(channel)} (${channel.id})\n${"=".repeat(72)}`;
-        return header + (error ? `\nERROR: ${error}` : `\n${messages.map(messageText).join("\n\n")}`);
-    }).join("");
-    return `Discord chat export${notice ? `\nINCOMPLETE: ${notice}` : ""}\nTarget: ${title}\nTarget ID: ${targetId}\nExported: ${new Date().toISOString()}\nChannels: ${channels.length}\nMessages: ${channels.reduce((n, c) => n + c.messages.length, 0)}${body}\n`;
+function messagesTxtFragment(messages: StoredMessage[]) {
+    return `${messages.map(storedMessageText).join("\n\n")}\n`;
 }
 
-function makeHtml(title: string, targetId: string, channels: ExportChannel[], notice = "") {
-    const sections = channels.map(({ channel, messages, error }) => `<section id="c-${channel.id}"><h2># ${escapeHtml(channelLabel(channel))}</h2>${error ? `<p class="error">${escapeHtml(error)}</p>` : messages.map(m => {
-        const author = m.author?.global_name || m.author?.username || "Unknown";
-        const attachments = settings.store.includeAttachments ? (m.attachments ?? []).map(a => `<a class="attachment" href="${escapeHtml(a.url)}" target="_blank" rel="noreferrer">📎 ${escapeHtml(a.filename)}</a>`).join("") : "";
-        const embeds = settings.store.includeAttachments ? (m.embeds ?? []).filter(e => e.url).map(e => `<a class="attachment" href="${escapeHtml(e.url)}" target="_blank" rel="noreferrer">🔗 ${escapeHtml(e.title ?? e.url)}</a>`).join("") : "";
-        return `<article><div class="meta"><b>${escapeHtml(author)}</b><span>${escapeHtml(m.timestamp)}</span><code>${m.id}</code></div><div class="content">${escapeHtml(richContent(m)).replace(/\n/g, "<br>")}</div>${attachments}${embeds}</article>`;
-    }).join("")}</section>`).join("");
-    const nav = channels.map(c => `<a href="#c-${c.channel.id}"># ${escapeHtml(channelLabel(c.channel))}</a>`).join("");
-    return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHtml(title)} Chat Export</title><style>*{box-sizing:border-box}body{margin:0;background:#1e1f22;color:#dbdee1;font:14px system-ui,sans-serif}.layout{display:grid;grid-template-columns:260px 1fr;min-height:100vh}aside{position:sticky;top:0;height:100vh;overflow:auto;background:#2b2d31;padding:20px}aside h1{font-size:18px}aside a{display:block;color:#b5bac1;text-decoration:none;padding:7px;border-radius:5px}aside a:hover{background:#35373c;color:#fff}main{max-width:1000px;padding:28px 40px}section{margin-bottom:55px}h2{border-bottom:1px solid #3f4147;padding-bottom:12px}article{padding:10px 12px;border-radius:5px}article:hover{background:#2b2d31}.meta{display:flex;gap:10px;align-items:baseline}.meta b{color:#fff}.meta span,.meta code{font-size:11px;color:#949ba4}.content{white-space:normal;margin-top:4px;line-height:1.5}.attachment{display:block;color:#00a8fc;margin-top:5px}.error{color:#f23f42}@media(max-width:700px){.layout{display:block}aside{position:relative;height:auto}main{padding:18px}}</style></head><body><div class="layout"><aside><h1>${escapeHtml(title)}</h1><p>${channels.reduce((n,c)=>n+c.messages.length,0)} messages</p>${nav}</aside><main><h1>${escapeHtml(title)} — Chat Export</h1><p>Exported: ${escapeHtml(new Date().toISOString())}</p><p>Target ID: ${escapeHtml(targetId)}</p>${notice ? `<p class="error">INCOMPLETE: ${escapeHtml(notice)}</p>` : ""}${sections}</main></div></body></html>`;
+function storedArticleHtml(message: StoredMessage) {
+    const attachments = settings.store.includeAttachments ? (message.attachments ?? []).map(a => `<a class="attachment" href="${escapeHtml(a.url)}" target="_blank" rel="noreferrer">📎 ${escapeHtml(a.filename)}</a>`).join("") : "";
+    return `<article><div class="meta"><b>${escapeHtml(message.author)}</b><span>${escapeHtml(message.timestamp)}</span><code>${message.messageId}</code></div><div class="content">${escapeHtml(message.content).replace(/\n/g, "<br>")}</div>${attachments}</article>`;
+}
+
+function exportHtmlHeader(title: string, targetId: string, channels: MessageTarget[]) {
+    const nav = channels.map(channel => `<a href="#c-${channel.id}"># ${escapeHtml(channelLabel(channel))}</a>`).join("");
+    return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHtml(title)} Chat Export</title><style>${EXPORT_CSS}</style></head><body><div class="layout"><aside><h1>${escapeHtml(title)}</h1>${nav}</aside><main><h1>${escapeHtml(title)} — Chat Export</h1><p>Exported: ${escapeHtml(new Date().toISOString())}</p><p>Target ID: ${escapeHtml(targetId)}</p>\n`;
+}
+
+function channelHtmlHeader(channel: MessageTarget) {
+    return `<section id="c-${channel.id}"><h2># ${escapeHtml(channelLabel(channel))}</h2>`;
+}
+
+function messagesHtmlFragment(messages: StoredMessage[]) {
+    return messages.map(storedArticleHtml).join("\n");
+}
+
+function exportHtmlFooter(total: number, savedChannels: number, notice: string) {
+    return `${notice ? `<p class="error">INCOMPLETE: ${escapeHtml(notice)}</p>` : ""}<p>Messages: ${total} / Channels: ${savedChannels}</p></main></div></body></html>`;
 }
 
 async function exportChannels(container: Container, label: string) {
     if (exporting) return showToast("既にエクスポート中です", Toasts.Type.MESSAGE);
     exporting = true; cancelled = false;
-    const output: ExportChannel[] = [];
+    let total = 0, savedChannels = 0;
     try {
         const discovery = container.discover ? await collectGuildTargets(container.id, () => !cancelled, () => true)
             : { channels: container.channels, issues: [] };
@@ -602,36 +680,104 @@ async function exportChannels(container: Container, label: string) {
             showToast(isLoggingBlocked(container.id) ? `${label}: この対象は停止リストに含まれています` : `${label}: 取得できるチャンネルがありません`, Toasts.Type.FAILURE);
             return;
         }
-        showToast(`${label}: ${channels.length}件の取得を開始`, Toasts.Type.MESSAGE);
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+        const base = `${safeName(label)}_${container.id}_${stamp}`;
+        const manifest = {
+            tool: "VesktopChatExporter",
+            started: new Date().toISOString(),
+            target: label,
+            targetId: container.id,
+            channels: channels.map(channel => ({ id: channel.id, name: channelLabel(channel), type: channel.type }))
+        };
+        const opened = await Native.beginExport(
+            container.category,
+            base,
+            `${JSON.stringify(manifest, null, 2)}\n`,
+            exportTxtHeader(label, container.id, channels),
+            exportHtmlHeader(label, container.id, channels)
+        );
+        showToast(`${label}: ${channels.length}件の取得を開始（逐次保存）`, Toasts.Type.MESSAGE);
+        // Phase 1: walk every channel and serialise each page to storage as it arrives. No page is
+        // ever kept in memory after it has been written, so the run is bounded by the largest page
+        // rather than by the size of the server, and a crash keeps everything already fetched.
+        const walked: { channel: MessageTarget; pages: string[]; }[] = [];
+        const failures: string[] = [];
+        let fetched = 0;
         for (let i = 0; i < channels.length && !cancelled; i++) {
             const channel = channels[i];
             if (isTargetBlocked(channel) || !canReadTarget(channel)) continue;
             const name = channelLabel(channel);
+            const pages: string[] = [];
+            const allowed = () => !isTargetBlocked(channel) && canReadTarget(channel);
             showToast(`[${i + 1}/${channels.length}] ${name} を取得中`, Toasts.Type.MESSAGE);
             try {
-                const messages = await fetchAllMessages(channel, count => {
-                    if (count % 500 === 0) showToast(`${name}: ${count}件取得`, Toasts.Type.MESSAGE);
+                await walkChannelHistory(channel, allowed, async page => {
+                    const stored = await Native.writeHistoryPageJson(container.category, base, channel.id, name, page.map(message => toHistoryMessage(message, container, channel)));
+                    if (stored) pages.push(stored.base);
+                    fetched += page.length;
+                    if (fetched % 500 === 0) showToast(`${name}: 累計${fetched}件保存`, Toasts.Type.MESSAGE);
                 });
-                output.push({ channel, messages });
             } catch (error) {
-                output.push({ channel, messages: [], error: `取得失敗 (HTTP ${statusOf(error) ?? "unknown"})` });
+                failures.push(`# ${name} (${channel.id}): 取得失敗 (HTTP ${statusOf(error) ?? "unknown"})`);
             }
+            walked.push({ channel, pages });
         }
-        if (cancelled || pluginStopped || authFailed) return showToast("エクスポートを中止しました", Toasts.Type.FAILURE);
-        // Re-check after awaits: a menu opened before blocking must not bypass it.
-        const allowedOutput = output.filter(item => !isTargetBlocked(item.channel) && canReadTarget(item.channel));
-        if (!allowedOutput.length) return;
-        const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-        const base = `${safeName(label)}_${container.id}_${stamp}`;
-        const saved = await Native.saveLogs(container.category, base, makeTxt(label, container.id, allowedOutput, issueText(issues)), makeHtml(label, container.id, allowedOutput, issueText(issues)));
-        const incomplete = issues.length > 0 || allowedOutput.some(item => item.error) || allowedOutput.length !== channels.length;
-        showToast(`${incomplete ? "一部のみ保存（不完全）" : "完了"}: ${allowedOutput.reduce((n, c) => n + c.messages.length, 0)}件 / ${saved.directory}`, incomplete ? Toasts.Type.FAILURE : Toasts.Type.SUCCESS);
+        // Phase 2: re-check every channel after all the waits (a menu opened before blocking, or
+        // access revoked while the run was under way, must not slip through), then assemble each
+        // section from the pages already on disk, oldest -> newest.
+        for (const { channel, pages } of walked) {
+            const name = channelLabel(channel);
+            if (isTargetBlocked(channel) || !canReadTarget(channel)) {
+                await Native.discardHistoryPages(container.category, base, channel.id, name, pages);
+                failures.push(`# ${name} (${channel.id}): 閲覧権限が取り消されました`);
+                continue;
+            }
+            await Native.appendExport(container.category, base, { txt: channelTxtHeader(channel), html: channelHtmlHeader(channel) });
+            // Pages arrived newest-first; the native listing sorts them oldest-first.
+            const ordered = (await Native.listHistoryPages(container.category, base, channel.id, name)).filter(page => pages.includes(page));
+            for (const page of ordered) {
+                const stored = await Native.readHistoryPage(container.category, base, channel.id, name, page) as StoredMessage[];
+                total += stored.length;
+                await Native.appendExport(container.category, base, { txt: messagesTxtFragment(stored), html: messagesHtmlFragment(stored) });
+            }
+            await Native.appendExport(container.category, base, { html: "</section>" });
+            savedChannels++;
+        }
+        const notice = [issueText(issues), ...failures].filter(Boolean).join("\n");
+        if (cancelled) {
+            if (!total) {
+                await Native.discardExport(container.category, base);
+                return showToast("エクスポートを中止しました（保存されたメッセージはありません）", Toasts.Type.FAILURE);
+            }
+            await Native.finishExport(
+                container.category,
+                base,
+                JSON.stringify({ finished: new Date().toISOString(), outcome: "cancelled", messages: total, savedChannels }),
+                exportTxtFooter(total, savedChannels, "CANCELLED"),
+                exportHtmlFooter(total, savedChannels, "CANCELLED")
+            );
+            return showToast(`エクスポートを中止しました（保存済み: ${total}件 / ${opened.directory}）`, Toasts.Type.FAILURE);
+        }
+        if (!total) {
+            await Native.discardExport(container.category, base);
+            return showToast(`${label}: 保存できるメッセージがありませんでした`, issues.length ? Toasts.Type.FAILURE : Toasts.Type.MESSAGE);
+        }
+        const saved = await Native.finishExport(
+            container.category,
+            base,
+            JSON.stringify({ finished: new Date().toISOString(), outcome: notice ? "incomplete" : "complete", messages: total, savedChannels, notice: notice || undefined }),
+            exportTxtFooter(total, savedChannels, notice),
+            exportHtmlFooter(total, savedChannels, notice)
+        );
+        const incomplete = notice.length > 0 || savedChannels !== channels.length;
+        showToast(`${incomplete ? "一部のみ保存（不完全）" : "完了"}: ${total}件 / ${saved.directory}`, incomplete ? Toasts.Type.FAILURE : Toasts.Type.SUCCESS);
     } catch (error) {
         showToast(`ログ保存に失敗 (HTTP ${statusOf(error) ?? "unknown"})`, Toasts.Type.FAILURE);
     } finally {
         exporting = false;
     }
 }
+
 
 function exportGuild(guild: Guild) {
     return exportChannels({ id: guild.id, name: guild.name, channels: getGuildParents(guild.id), discover: true }, guild.name);

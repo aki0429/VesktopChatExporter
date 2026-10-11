@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { loadPlugin, id, items, message } from "./harness.mjs";
+import { exportText, loadPlugin, id, items, message } from "./harness.mjs";
 
 const dm = { id: id(1), type: 1, recipients: [id(2)], rawRecipients: [] };
 const group = { id: id(3), type: 3, name: "Fixture group", recipients: [id(2)] };
@@ -13,8 +13,8 @@ test("DM user context resolves the existing DM when no channel prop is passed", 
     assert.ok(item, "DM save menu must be available from a user-only context");
     await item.props.action();
     assert.equal(app.requests[0].url, `/channels/${dm.id}/messages`);
-    assert.equal(app.saved[0].args[0], "DMs");
-    assert.match(app.saved[0].args[2], /fixture message 10/);
+    assert.equal(app.saved.find(s => s.kind === "export-begin").args[0], "DMs");
+    assert.match(exportText(app), /fixture message 10/);
 });
 
 test("DM labels resolve recipient IDs from the user store", () => {

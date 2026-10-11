@@ -46,6 +46,12 @@ function normalize(target: MessageTarget): MessageTarget {
     };
 }
 
+// Parents whose own messages get exported: text, voice, announcement and stage channels.
+// Voice and stage channels carry a text chat, so "全チャンネルのログを保存" must include them.
+const LEAF_TYPES = [0, 2, 5, 13];
+// Only these parents support threads; voice/stage text has no thread list to enumerate.
+const THREAD_PARENT_TYPES = [0, 5, 15, 16];
+
 // get returns a response body and owns pacing/429 retries; no membership is changed here.
 // canRead must check VIEW_CHANNEL/READ_MESSAGE_HISTORY without assuming Channel methods.
 export async function discoverGuildTargets(options: DiscoveryOptions): Promise<{ channels: MessageTarget[]; issues: DiscoveryIssue[]; }> {
@@ -57,7 +63,7 @@ export async function discoverGuildTargets(options: DiscoveryOptions): Promise<{
     for (const parent of parents) {
         if (!record(parent) || !isId(parent.id) || (parent.guild_id !== undefined && parent.guild_id !== options.guildId)) {
             issues.push({ scope: `/guilds/${options.guildId}/channels`, message: "Invalid parent channel" });
-        } else if ([0, 5, 15, 16].includes(parent.type)) {
+        } else if ([...LEAF_TYPES, 15, 16].includes(parent.type)) {
             parentMap.set(parent.id, parent);
         }
     }
@@ -86,7 +92,7 @@ export async function discoverGuildTargets(options: DiscoveryOptions): Promise<{
     };
     const allowed = (target: MessageTarget) => !isStopped() && canRead(target) && !isBlocked(target);
     for (const parent of parentMap.values()) {
-        if ([0, 5].includes(parent.type) && allowed(parent)) targets.set(parent.id, normalize(parent));
+        if (LEAF_TYPES.includes(parent.type) && allowed(parent)) targets.set(parent.id, normalize(parent));
     }
     const addThreads = (threads: unknown[], scope: string, expectedParent?: MessageTarget, privateRoute?: boolean) => {
         let valid = true;
@@ -145,7 +151,7 @@ export async function discoverGuildTargets(options: DiscoveryOptions): Promise<{
         }
     };
     for (const parent of parentMap.values()) {
-        if (options.scanActive(parent)) await search(parent);
+        if (THREAD_PARENT_TYPES.includes(parent.type) && options.scanActive(parent)) await search(parent);
     }
     const archive = async (parent: MessageTarget, kind: "public" | "private" | "joined") => {
         const url = `/channels/${parent.id}/${kind === "joined" ? "users/@me/" : ""}threads/archived/${kind === "public" ? "public" : "private"}`;
@@ -171,7 +177,7 @@ export async function discoverGuildTargets(options: DiscoveryOptions): Promise<{
         }
     };
     for (const parent of parentMap.values()) {
-        if (!allowed(parent)) continue;
+        if (!THREAD_PARENT_TYPES.includes(parent.type) || !allowed(parent)) continue;
         await archive(parent, "public");
         if (parent.type === 0 && allowed(parent)) await archive(parent, options.canManage(parent) ? "private" : "joined");
     }
