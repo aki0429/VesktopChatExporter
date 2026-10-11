@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { exportHtml, exportJson, exportStarted, exportText, loadPlugin, id, message } from "./harness.mjs";
+import { exportFilesOpened, exportHtml, exportJson, exportManifest, exportStarted, exportText, loadPlugin, id, message } from "./harness.mjs";
 
 const guild = { id: id(100), name: "Private thread fixture" };
 const parent = { id: id(1), type: 0, name: "parent", guild_id: guild.id };
@@ -29,6 +29,12 @@ function assertPrivateNotSaved(app) {
     }
     for (const [file] of app.files)
         assert.ok(!file.includes(privateThread.id), "no part file may survive for the revoked private thread");
+    // The saved run must not name or link the revoked thread anywhere: not in the html sidebar, the
+    // txt header, the footer notice or the manifest channel list. A revocation is reported as a
+    // count, never by an id or a name.
+    for (const output of [exportText(app), exportHtml(app), exportManifest(app)])
+        assert.ok(!output.includes(privateThread.id) && !output.includes(privateThread.name),
+            "a revoked private thread must not be named or linked in the saved output");
 }
 
 function assertPrivateSaved(app, mode) {
@@ -43,6 +49,30 @@ function assertPrivateSaved(app, mode) {
         assert.equal(saved.args[5][0].content, privateContent);
     }
 }
+
+test("a private thread revoked after a page was written leaves no id, name or link in the saved run", async () => {
+    let managed = true;
+    let calls = 0;
+    const app = loadPlugin({
+        channels: [parent, privateThread], guilds: [guild],
+        can: bit => bit !== 4n || managed,
+        hasJoined: () => false,
+        rest: ({ url }) => {
+            if (url === privateUrl) {
+                calls++;
+                // The first page is already on disk when the next request finds the access revoked,
+                // so the run has to drop that page and must never name or link the thread again.
+                if (calls > 1) managed = false;
+                return { body: calls === 1 ? Array.from({ length: 100 }, (_, i) => ({ ...message(200 + i), content: privateContent })) : [privateMessage()] };
+            }
+            return url.endsWith("/messages") ? { body: [message(21)] } : archiveResponse(url);
+        }
+    });
+    await app.hooks.exportGuild(guild);
+    assert.ok(app.saved.some(s => s.kind === "history" && s.channelId === privateThread.id), "the first page is written before access is revoked");
+    assertPrivateNotSaved(app);
+    assert.ok(exportFilesOpened(app), "the run still opened its aggregate files for the surviving channels");
+});
 
 const run = (app, mode) => mode === "manual" ? app.hooks.exportGuild(guild) : app.hooks.crawlAllHistory();
 

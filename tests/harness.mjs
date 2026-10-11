@@ -40,6 +40,9 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
     const files = new Map();
     const pages = new Map();
     const dirOf = category => `fixture/${category ?? "logs"}`;
+    // Mirrors native.ts: a channel folder name is sanitised before it becomes a path segment.
+    const safeName = value => String(value ?? "").replace(/[\\/:*?"<>|]/g, "_").trim().slice(0, 80) || "server";
+    const partsDir = (category, baseName, channelId, channelName) => `${dirOf(category)}/${safeName(baseName)}.parts/${channelId}_${safeName(channelName)}`;
     const pageStore = (category, baseName, channelId) => {
         const key = `${category ?? ""}|${baseName}|${channelId}`;
         if (!pages.has(key)) pages.set(key, new Map());
@@ -58,12 +61,22 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
             pageStore(category, guildId, channelId).set(base, messages);
             return { directory: dirOf(category), count: messages.length };
         },
-        // Streaming export: one file per run, opened up front and appended page by page.
-        beginExport: async (category, baseName, manifest, txtHeader, htmlHeader) => {
+        // The run stub is opened before the first request; the aggregate files are opened only after
+        // the phase-2 re-check, so their header can be built from the surviving channels.
+        beginExport: async (category, baseName, manifest) => {
             files.set(`${dirOf(category)}/${baseName}.manifest.json`, manifest);
+            saved.push({ kind: "export-begin", args: [category, baseName, manifest] });
+            return {
+                directory: dirOf(category), base: baseName,
+                txtPath: `${dirOf(category)}/${baseName}.txt`,
+                htmlPath: `${dirOf(category)}/${baseName}.html`,
+                manifestPath: `${dirOf(category)}/${baseName}.manifest.json`
+            };
+        },
+        startExportFiles: async (category, baseName, txtHeader, htmlHeader) => {
+            saved.push({ kind: "export-files", args: [category, baseName, txtHeader, htmlHeader] });
             files.set(`${dirOf(category)}/${baseName}.txt`, txtHeader);
             files.set(`${dirOf(category)}/${baseName}.html`, htmlHeader);
-            saved.push({ kind: "export-begin", args: [category, baseName, manifest, txtHeader, htmlHeader] });
             return {
                 directory: dirOf(category), base: baseName,
                 txtPath: `${dirOf(category)}/${baseName}.txt`,
@@ -88,29 +101,37 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
             saved.push({ kind: "export-discard", args: [category, baseName] });
             for (const name of [`${baseName}.txt`, `${baseName}.html`, `${baseName}.manifest.json`])
                 files.delete(`${dirOf(category)}/${name}`);
+            // Like the native side, a discarded run takes this run's per-page parts with it.
+            for (const file of [...files.keys()])
+                if (file.startsWith(`${dirOf(category)}/${safeName(baseName)}.parts/`)) files.delete(file);
+            for (const key of [...pages.keys()])
+                if (key.startsWith(`${category ?? ""}|${baseName}|`)) pages.delete(key);
             return { removed: 3 };
         },
         // Per-page JSON: stored the moment a page arrives, read back to assemble the aggregate.
         writeHistoryPageJson: async (category, baseName, channelId, channelName, messages) => {
-            if (!messages.length) return null;
+            if (!/^\d{17,20}$/.test(channelId) || !messages.length) return null;
             const ordered = [...messages].sort((left, right) => byId(left.messageId, right.messageId));
             const base = `${ordered[0].messageId}_${ordered[ordered.length - 1].messageId}`;
             pageStore(category, baseName, channelId).set(base, ordered);
             saved.push({ kind: "history", channelId, args: [category, baseName, channelId, channelName, messages] });
-            const file = `${dirOf(category)}/${baseName}.parts/${channelId}_${channelName}/${base}.jsonl`;
+            const file = `${partsDir(category, baseName, channelId, channelName)}/${base}.jsonl`;
             files.set(file, `${ordered.map(message => JSON.stringify(message)).join("\n")}\n`);
             return { base, path: file, count: ordered.length };
         },
         listHistoryPages: async (category, baseName, channelId, channelName) =>
-            [...pageStore(category, baseName, channelId).keys()].sort((left, right) => byId(left.split("_")[0], right.split("_")[0])),
+            !/^\d{17,20}$/.test(channelId) ? []
+                : [...pageStore(category, baseName, channelId).keys()].sort((left, right) => byId(left.split("_")[0], right.split("_")[0])),
         readHistoryPage: async (category, baseName, channelId, channelName, base) =>
-            pageStore(category, baseName, channelId).get(base) ?? [],
+            !/^\d{17,20}$/.test(channelId) || !/^\d{17,20}_\d{17,20}$/.test(base) ? []
+                : pageStore(category, baseName, channelId).get(base) ?? [],
         discardHistoryPages: async (category, baseName, channelId, channelName, bases) => {
             saved.push({ kind: "history-discard", channelId, args: [category, baseName, channelId, channelName, bases] });
+            if (!/^\d{17,20}$/.test(channelId)) return { removed: 0 };
             const store = pageStore(category, baseName, channelId);
             for (const base of bases) {
                 store.delete(base);
-                files.delete(`${dirOf(category)}/${baseName}.parts/${channelId}_${channelName}/${base}.jsonl`);
+                files.delete(`${partsDir(category, baseName, channelId, channelName)}/${base}.jsonl`);
             }
             return { removed: bases.length };
         },
@@ -155,9 +176,11 @@ export const items = children => children.filter(x => x?.type === "item");
 export const exportFiles = app => app.files;
 export const exportWrites = app => app.saved.filter(s => s.kind === "export");
 export const exportStarted = app => app.saved.some(s => s.kind === "export-begin");
+export const exportFilesOpened = app => app.saved.some(s => s.kind === "export-files");
 export const exportFinished = app => app.saved.some(s => s.kind === "export-finish");
 export const exportDiscarded = app => app.saved.some(s => s.kind === "export-discard");
 const exportFile = (app, extension) => [...app.files].filter(([file]) => file.endsWith(extension)).map(([, text]) => text).join("\n");
 export const exportText = app => exportFile(app, ".txt");
 export const exportHtml = app => exportFile(app, ".html");
 export const exportJson = app => exportFile(app, ".jsonl");
+export const exportManifest = app => exportFile(app, ".manifest.json");

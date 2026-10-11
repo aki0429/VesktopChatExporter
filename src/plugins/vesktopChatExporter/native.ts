@@ -172,14 +172,29 @@ export async function beginExport(
     _: IpcMainInvokeEvent,
     category: string | undefined,
     baseName: string,
-    manifest: string,
+    manifest: string
+) {
+    const paths = exportPaths(category, baseName);
+    await mkdir(paths.directory, { recursive: true });
+    // Only the run stub is written here. The aggregate files are created after the phase-2
+    // authorization re-check (startExportFiles) so their header and navigation can be built from the
+    // channels the run really saved.
+    await writeFile(paths.manifestPath, manifest, "utf8");
+    return paths;
+}
+
+// The aggregate files are opened only once every channel has been re-checked, so a channel revoked
+// mid-run can never appear in the saved output, not even as a navigation link or a name.
+export async function startExportFiles(
+    _: IpcMainInvokeEvent,
+    category: string | undefined,
+    baseName: string,
     txtHeader: string,
     htmlHeader: string
 ) {
     const paths = exportPaths(category, baseName);
     await mkdir(paths.directory, { recursive: true });
     await Promise.all([
-        writeFile(paths.manifestPath, manifest, "utf8"),
         writeFile(paths.txtPath, txtHeader, "utf8"),
         writeFile(paths.htmlPath, htmlHeader, "utf8")
     ]);
@@ -268,6 +283,7 @@ export async function listHistoryPages(
     channelId: string,
     channelName: string
 ) {
+    if (!/^\d{17,20}$/.test(channelId)) return [];
     const directory = partsDir(category, baseName, channelId, channelName);
     const names = await readdir(directory).catch(() => [] as string[]);
     return names
@@ -284,6 +300,7 @@ export async function readHistoryPage(
     channelName: string,
     base: string
 ) {
+    if (!/^\d{17,20}$/.test(channelId)) throw new Error("不正なチャンネルIDです");
     if (!/^\d{17,20}_\d{17,20}$/.test(base)) throw new Error("不正な履歴ページ名です");
     const text = await readFile(join(partsDir(category, baseName, channelId, channelName), `${base}.jsonl`), "utf8");
     return text.split("\n").filter(line => line.trim()).map(line => JSON.parse(line) as HistoryMessage);
@@ -298,6 +315,7 @@ export async function discardHistoryPages(
     channelName: string,
     bases: string[]
 ) {
+    if (!/^\d{17,20}$/.test(channelId)) return { removed: 0 };
     const directory = partsDir(category, baseName, channelId, channelName);
     let removed = 0;
     for (const base of bases) {

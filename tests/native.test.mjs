@@ -117,15 +117,22 @@ test("per-page JSON parts are written as each page arrives, listed oldest-first 
     }
 });
 
-test("the aggregate is opened once, appended page by page and closed with a manifest", async () => {
+test("the run stub is opened first, the aggregate files only after the re-check, then closed with a manifest", async () => {
     const scratch = process.env.TMPDIR;
     assert.ok(scratch, "TMPDIR must point to the test scratch directory");
     const dir = await mkdtemp(path.join(scratch, "vesktop-stream-test-"));
     try {
         const native = await loadNative(dir);
         const run = "Fixture_100_stream";
-        const opened = await native.beginExport(null, undefined, run, "{\"tool\":\"fixture\"}\n", "HEADER\n", "<html>HEAD");
+        const opened = await native.beginExport(null, undefined, run, "{\"tool\":\"fixture\"}\n");
         assert.match(opened.partsDir, /\.parts$/);
+        // A revoked channel must be able to leave the run without a header: the aggregate files do not
+        // exist until the surviving channel list is known.
+        await assert.rejects(() => readFile(opened.txtPath, "utf8"));
+        await assert.rejects(() => readFile(opened.htmlPath, "utf8"));
+        const started = await native.startExportFiles(null, undefined, run, "HEADER\n", "<html>HEAD");
+        assert.equal(started.txtPath, opened.txtPath);
+        assert.equal(started.htmlPath, opened.htmlPath);
         await native.appendExport(null, undefined, run, { txt: "page one\n", html: "<article>1</article>" });
         await native.appendExport(null, undefined, run, { txt: "page two\n" });
         const done = await native.finishExport(null, undefined, run, "{\"outcome\":\"complete\"}", "FOOTER\n", "</html>");
@@ -134,6 +141,24 @@ test("the aggregate is opened once, appended page by page and closed with a mani
         assert.equal(await readFile(opened.htmlPath, "utf8"), "<html>HEAD<article>1</article></html>");
         assert.match(await readFile(opened.manifestPath, "utf8"), /"outcome":"complete"/);
         assert.ok(done.bytes.txt > 0 && done.bytes.manifest > 0);
+    } finally {
+        await rm(dir, { recursive: true, force: true });
+    }
+});
+
+test("page readers refuse a channel id that is not a snowflake", async () => {
+    const scratch = process.env.TMPDIR;
+    const dir = await mkdtemp(path.join(scratch, "vesktop-chan-guard-"));
+    try {
+        const native = await loadNative(dir);
+        const run = "Fixture_100_guard";
+        const written = await native.writeHistoryPageJson(null, undefined, run, id(1), "chan", [part(id(1), 1)]);
+        assert.ok(written, "a valid channel id is accepted");
+        assert.deepEqual([...await native.listHistoryPages(null, undefined, run, "../../etc", "chan")], []);
+        await assert.rejects(() => native.readHistoryPage(null, undefined, run, "../../etc", "chan", written.base));
+        assert.equal((await native.discardHistoryPages(null, undefined, run, "../../etc", "chan", [written.base])).removed, 0);
+        // The valid page is untouched by those refused calls.
+        assert.deepEqual([...await native.listHistoryPages(null, undefined, run, id(1), "chan")], [written.base]);
     } finally {
         await rm(dir, { recursive: true, force: true });
     }

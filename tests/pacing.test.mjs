@@ -57,3 +57,24 @@ test("with adaptive pacing off the interval never exceeds the configured one", a
     assert.ok(paced.length > 0);
     assert.ok(paced.every(ms => ms === 750), "a fixed interval must be respected");
 });
+
+test("a failing request slows the pace too, exactly as the setting promises", async () => {
+    const { nextDelay, DELAY_CEILING } = loadPlugin({}).hooks;
+    assert.equal(nextDelay(1000, "error"), 1500, "a non-429 failure raises the interval by half");
+    assert.equal(nextDelay(9000, "error"), DELAY_CEILING, "and never exceeds the ceiling");
+
+    // End to end: the first channel fails with a non-429 status, the second must then be requested
+    // with a longer interval than the failing request itself used.
+    const a = { id: id(1), type: 0, name: "a", guild_id: guild.id };
+    const b = { id: id(2), type: 0, name: "b", guild_id: guild.id };
+    const app = loadPlugin({ channels: [a, b], guilds: [guild], rest: ({ url }) => {
+        if (!url.endsWith("/messages")) return { body: { threads: [], has_more: false } };
+        if (url === `/channels/${a.id}/messages`) throw { status: 500 };
+        return page(1, 50);
+    } });
+    await app.hooks.exportGuild(guild);
+
+    const paced = pacedIntervals(app);
+    assert.ok(paced.length >= 2, `both channels must be requested (${paced.join(",")})`);
+    assert.ok(paced.at(-1) > paced.at(-2), `the request after a failure must use a raised interval (${paced.join(",")})`);
+});

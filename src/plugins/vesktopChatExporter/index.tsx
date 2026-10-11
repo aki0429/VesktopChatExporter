@@ -430,7 +430,11 @@ function queuedGet(url: string, query: Record<string, string | number | boolean>
                     authFailed = true;
                     showToast("認証エラー: ログ取得を停止しました。再ログイン後にプラグインを再起動してください", Toasts.Type.FAILURE);
                 }
-                if (statusOf(error) !== 429) throw error;
+                if (statusOf(error) !== 429) {
+                    // Any other failure slows the pace too, exactly as the setting promises.
+                    adaptiveDelay = nextDelay(adaptiveDelay, "error", baseDelay());
+                    throw error;
+                }
                 const wait = retryAfterMs(error);
                 adaptiveDelay = nextDelay(adaptiveDelay, "throttled", baseDelay());
                 showToast(`429: ${Math.ceil(wait / 1000)}秒以上、すべてのログ取得を待機`, Toasts.Type.FAILURE);
@@ -682,20 +686,17 @@ async function exportChannels(container: Container, label: string) {
         }
         const stamp = new Date().toISOString().replace(/[:.]/g, "-");
         const base = `${safeName(label)}_${container.id}_${stamp}`;
+        // The run is opened with counts only. The manifest channel list and the html navigation are
+        // written after the phase-2 re-check (startExportFiles), from the channels the run really
+        // saved, so a channel revoked mid-run can never survive in the output as a name or a link.
         const manifest = {
             tool: "VesktopChatExporter",
             started: new Date().toISOString(),
             target: label,
             targetId: container.id,
-            channels: channels.map(channel => ({ id: channel.id, name: channelLabel(channel), type: channel.type }))
+            discovered: channels.length
         };
-        const opened = await Native.beginExport(
-            container.category,
-            base,
-            `${JSON.stringify(manifest, null, 2)}\n`,
-            exportTxtHeader(label, container.id, channels),
-            exportHtmlHeader(label, container.id, channels)
-        );
+        const opened = await Native.beginExport(container.category, base, `${JSON.stringify(manifest, null, 2)}\n`);
         showToast(`${label}: ${channels.length}件の取得を開始（逐次保存）`, Toasts.Type.MESSAGE);
         // Phase 1: walk every channel and serialise each page to storage as it arrives. No page is
         // ever kept in memory after it has been written, so the run is bounded by the largest page
@@ -703,12 +704,15 @@ async function exportChannels(container: Container, label: string) {
         const walked: { channel: MessageTarget; pages: string[]; }[] = [];
         const failures: string[] = [];
         let fetched = 0;
+        // A channel the account may not read is only ever counted: the run must leave no trace of it,
+        // so it is never named in the manifest, the aggregate or the notices.
+        let revoked = 0;
         for (let i = 0; i < channels.length && !cancelled; i++) {
             const channel = channels[i];
-            if (isTargetBlocked(channel) || !canReadTarget(channel)) continue;
             const name = channelLabel(channel);
-            const pages: string[] = [];
             const allowed = () => !isTargetBlocked(channel) && canReadTarget(channel);
+            if (!allowed()) { revoked++; continue; }
+            const pages: string[] = [];
             showToast(`[${i + 1}/${channels.length}] ${name} を取得中`, Toasts.Type.MESSAGE);
             try {
                 await walkChannelHistory(channel, allowed, async page => {
@@ -718,20 +722,39 @@ async function exportChannels(container: Container, label: string) {
                     if (fetched % 500 === 0) showToast(`${name}: 累計${fetched}件保存`, Toasts.Type.MESSAGE);
                 });
             } catch (error) {
+                // Access revoked while this channel was being walked: discard this run's pages for it
+                // instead of reporting a named failure.
+                if (!allowed()) {
+                    revoked++;
+                    await Native.discardHistoryPages(container.category, base, channel.id, name, pages);
+                    continue;
+                }
                 failures.push(`# ${name} (${channel.id}): 取得失敗 (HTTP ${statusOf(error) ?? "unknown"})`);
             }
             walked.push({ channel, pages });
         }
         // Phase 2: re-check every channel after all the waits (a menu opened before blocking, or
-        // access revoked while the run was under way, must not slip through), then assemble each
-        // section from the pages already on disk, oldest -> newest.
-        for (const { channel, pages } of walked) {
-            const name = channelLabel(channel);
-            if (isTargetBlocked(channel) || !canReadTarget(channel)) {
-                await Native.discardHistoryPages(container.category, base, channel.id, name, pages);
-                failures.push(`# ${name} (${channel.id}): 閲覧権限が取り消されました`);
+        // access revoked while the run was under way, must not slip through), then open the aggregate
+        // files from the surviving channels only and fill them from the pages already on disk,
+        // oldest -> newest.
+        const surviving: { channel: MessageTarget; pages: string[]; }[] = [];
+        for (const entry of walked) {
+            if (isTargetBlocked(entry.channel) || !canReadTarget(entry.channel)) {
+                revoked++;
+                await Native.discardHistoryPages(container.category, base, entry.channel.id, channelLabel(entry.channel), entry.pages);
                 continue;
             }
+            surviving.push(entry);
+        }
+        const savedList = surviving.map(entry => entry.channel);
+        await Native.startExportFiles(
+            container.category,
+            base,
+            exportTxtHeader(label, container.id, savedList),
+            exportHtmlHeader(label, container.id, savedList)
+        );
+        for (const { channel, pages } of surviving) {
+            const name = channelLabel(channel);
             await Native.appendExport(container.category, base, { txt: channelTxtHeader(channel), html: channelHtmlHeader(channel) });
             // Pages arrived newest-first; the native listing sorts them oldest-first.
             const ordered = (await Native.listHistoryPages(container.category, base, channel.id, name)).filter(page => pages.includes(page));
@@ -743,7 +766,23 @@ async function exportChannels(container: Container, label: string) {
             await Native.appendExport(container.category, base, { html: "</section>" });
             savedChannels++;
         }
-        const notice = [issueText(issues), ...failures].filter(Boolean).join("\n");
+        const notice = [
+            issueText(issues),
+            ...failures,
+            revoked ? `閲覧権限が取り消されたチャンネル: ${revoked}件（この実行の出力からは除外し、名前やIDも記録していません）` : ""
+        ].filter(Boolean).join("\n");
+        const summary = (outcome: string) => JSON.stringify({
+            finished: new Date().toISOString(),
+            outcome,
+            target: label,
+            targetId: container.id,
+            discovered: channels.length,
+            savedChannels,
+            revoked,
+            messages: total,
+            channels: savedList.map(channel => ({ id: channel.id, name: channelLabel(channel), type: channel.type })),
+            notice: notice || undefined
+        }, null, 2);
         if (cancelled) {
             if (!total) {
                 await Native.discardExport(container.category, base);
@@ -752,7 +791,7 @@ async function exportChannels(container: Container, label: string) {
             await Native.finishExport(
                 container.category,
                 base,
-                JSON.stringify({ finished: new Date().toISOString(), outcome: "cancelled", messages: total, savedChannels }),
+                summary("cancelled"),
                 exportTxtFooter(total, savedChannels, "CANCELLED"),
                 exportHtmlFooter(total, savedChannels, "CANCELLED")
             );
@@ -765,7 +804,7 @@ async function exportChannels(container: Container, label: string) {
         const saved = await Native.finishExport(
             container.category,
             base,
-            JSON.stringify({ finished: new Date().toISOString(), outcome: notice ? "incomplete" : "complete", messages: total, savedChannels, notice: notice || undefined }),
+            summary(notice ? "incomplete" : "complete"),
             exportTxtFooter(total, savedChannels, notice),
             exportHtmlFooter(total, savedChannels, notice)
         );
