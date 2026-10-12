@@ -43,7 +43,7 @@ function htmlHeader(message: LiveRecord) {
 }
 
 const queues = new Map<string, Promise<void>>();
-type Segment = { start: number; end: number; lines?: number; };
+type Segment = { start: number; end: number; lines?: number; legacy?: boolean; };
 const HTML_FOOTER = "</body></html>\n";
 
 function recordDay(message: LiveRecord) {
@@ -104,20 +104,27 @@ async function* byteLines(path: string) {
 
 async function indexFile(path: string, html: boolean, expectedTxt?: Array<{ id: string; lines: number; }>) {
     const entries = new Map<string, Segment>();
+    let footer = false;
     let size: number;
     try { size = (await stat(path)).size; }
     catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return entries;
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return { entries, footer };
         throw error;
     }
 
     let offset = 0;
-    let pending: { id: string; start: number; } | undefined;
+    let lastEnd: number | undefined;
+    let pending: { id: string; start: number; legacy?: boolean; } | undefined;
     let remaining = 0;
+    let suffixed = false;
     {
         for await (const { line, end } of byteLines(path)) {
             if (html) {
-                if (line.startsWith("<article>")) {
+                if (footer) throw new Error("Invalid live HTML tail");
+                if (line === "</body></html>") {
+                    if (pending) throw new Error("Invalid live HTML article");
+                    footer = true;
+                } else if (line.startsWith("<article>")) {
                     if (pending) throw new Error("Invalid live HTML article");
                     const id = /<code>(\d{17,20})<\/code>/.exec(line)?.[1];
                     if (!id || entries.has(id)) throw new Error("Invalid live HTML ID");
@@ -128,19 +135,31 @@ async function indexFile(path: string, html: boolean, expectedTxt?: Array<{ id: 
                 if (pending && line.endsWith("</article>")) {
                     entries.set(pending.id, { start: pending.start, end, lines: remaining });
                     pending = undefined;
+                    lastEnd = end;
                 }
             } else {
                 // HTML supplies the exact number of body lines for each real
-                // article. Header-shaped content is never a boundary candidate.
+                // article. The old writer's TXT omits the ID suffix; those entries
+                // are matched positionally to their HTML article and are accepted
+                // only as a leading run. Body lines stay data: the walk moves by
+                // the HTML line counts and never re-scans content as a boundary.
                 const expected = expectedTxt?.[entries.size];
                 if (!pending && expected) {
-                    const id = /^\[[^\]\r\n]+\] .* \([^\r\n]*\) \[(\d{17,20})\]$/.exec(line)?.[1];
-                    if (id !== expected.id) throw new Error("Invalid live TXT/HTML boundary");
-                    pending = { id, start: offset };
+                    const suffixedId = /^\[[^\]\r\n]+\] .* \([^\r\n]*\) \[(\d{17,20})\]$/.exec(line)?.[1];
+                    if (suffixedId) {
+                        if (suffixedId !== expected.id) throw new Error("Invalid live TXT/HTML boundary");
+                        pending = { id: suffixedId, start: offset };
+                        suffixed = true;
+                    } else {
+                        if (suffixed || !/^\[[^\]\r\n]+\] .* \([^\r\n]*\)$/.test(line)) throw new Error("Invalid live TXT/HTML boundary");
+                        pending = { id: expected.id, start: offset, legacy: true };
+                    }
                     remaining = expected.lines;
                 } else if (pending && --remaining === 0) {
-                    entries.set(pending.id, { start: pending.start, end });
+                    if (line !== "") throw new Error("Invalid live TXT archive");
+                    entries.set(pending.id, { start: pending.start, end, legacy: pending.legacy });
                     pending = undefined;
+                    lastEnd = end;
                 }
             }
             offset = end;
@@ -148,9 +167,15 @@ async function indexFile(path: string, html: boolean, expectedTxt?: Array<{ id: 
         if (pending) {
             throw new Error("Incomplete live archive article");
         }
-        if (!html && (offset !== size || entries.size !== expectedTxt?.length)) throw new Error("Invalid live TXT archive");
+        if (html) {
+            // A footerless HTML is either an untouched old-format file or corrupt.
+            if (!footer && size !== 0 && lastEnd !== size) throw new Error("Invalid live HTML tail");
+        } else {
+            const expectedCount = expectedTxt?.length ?? 0;
+            if (offset !== size || entries.size !== expectedCount || (size !== 0 && lastEnd !== size)) throw new Error("Invalid live TXT archive");
+        }
     }
-    return entries;
+    return { entries, footer };
 }
 
 async function copySegment(source: string, target: string, segment: Segment) {
@@ -169,17 +194,35 @@ async function copySegment(source: string, target: string, segment: Segment) {
 async function writeArchive(directory: string, txtPath: string, htmlPath: string, message: LiveRecord) {
     await mkdir(directory, { recursive: true });
     await recoverPair(txtPath, htmlPath);
-    const html = await indexFile(htmlPath, true);
-    const txt = await indexFile(txtPath, false, [...html].map(([id, segment]) => ({ id, lines: segment.lines! })));
+    const { entries: html, footer: htmlHasFooter } = await indexFile(htmlPath, true);
+    const { entries: txt } = await indexFile(txtPath, false, [...html].map(([id, segment]) => ({ id, lines: segment.lines! })));
     const ids = new Set([...txt.keys(), ...html.keys(), message.messageId]);
     for (const id of ids) {
         if (id !== message.messageId && (!txt.has(id) || !html.has(id))) throw new Error("Incomplete live archive pair; retry the missing ID");
+    }
+    // An old-format pair has no ID in its TXT and no closing footer in its HTML;
+    // the first rewrite adds both. Any other combination is a damaged pair.
+    const legacy = [...txt.keys()].filter(id => txt.get(id)!.legacy);
+    if (htmlHasFooter !== (txt.size > 0 && legacy.length !== txt.size)) {
+        throw new Error(htmlHasFooter ? "Invalid live TXT/HTML boundary" : "Invalid live HTML footer");
     }
     const ordered = [...ids].sort((a, b) => BigInt(a) < BigInt(b) ? -1 : 1);
     if (txt.has(message.messageId) && html.has(message.messageId)) {
         await rm(`${txtPath}.stage`, { force: true });
         await rm(`${htmlPath}.stage`, { force: true });
         return { directory, txtPath, htmlPath, count: ordered.length };
+    }
+    // Old-format entries carry their ID only in the paired HTML, so their stored
+    // position is the only record of the original order. They are never rewritten
+    // or re-sorted: only a strictly newer ID is allowed to follow them.
+    if (legacy.length) {
+        const stored = [...txt.keys()];
+        if (!stored.every((id, index) => index === 0 || BigInt(stored[index - 1]) < BigInt(id))) {
+            throw new Error("Legacy live archive order conflict; existing entries are out of ID order");
+        }
+        if (BigInt(message.messageId) < BigInt(stored[stored.length - 1])) {
+            throw new Error("Legacy live archive order conflict; only an ID newer than every stored ID can be appended without rewriting legacy bytes");
+        }
     }
     if (html.size && ordered[ordered.length - 1] === message.messageId) {
         try {
@@ -190,8 +233,9 @@ async function writeArchive(directory: string, txtPath: string, htmlPath: string
                 const size = (await file.stat()).size;
                 const footer = Buffer.alloc(Buffer.byteLength(HTML_FOOTER));
                 const { bytesRead } = await file.read(footer, 0, footer.length, size - footer.length);
-                if (bytesRead !== footer.length || footer.toString("utf8") !== HTML_FOOTER) throw new Error("Invalid live HTML footer");
-                await file.truncate(size - footer.length);
+                // An old-format HTML has no footer to move; a current one must still end with it.
+                if (bytesRead === footer.length && footer.toString("utf8") === HTML_FOOTER) await file.truncate(size - footer.length);
+                else if (htmlHasFooter) throw new Error("Invalid live HTML footer");
             } finally { await file.close(); }
             await appendFile(htmlPath, formatHtml(message) + HTML_FOOTER, "utf8");
             await rm(`${txtPath}.rollback.stage`, { force: true });

@@ -6,6 +6,7 @@ import { createRequire } from "node:module";
 import * as fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
 
 const require = createRequire(import.meta.url);
 const baseline = process.env.LIVE_ARCHIVE_BASELINE === "1";
@@ -40,6 +41,49 @@ async function fixture(run) {
     finally { await fs.rm(root, { recursive: true, force: true }); }
 }
 
+// Execute the historical writer, rather than hand-recreating its output.
+const legacyCode = buildSync({
+    stdin: {
+        contents: execFileSync("git", ["show", "0b56999:src/plugins/vesktopChatExporter/native.ts"], {
+            cwd: fileURLToPath(new URL("../", import.meta.url)), encoding: "utf8"
+        }),
+        sourcefile: "legacy-0b56999-native.ts", loader: "ts", resolveDir: path.dirname(source)
+    },
+    bundle: true, write: false, format: "cjs", platform: "node", external: ["electron"]
+}).outputFiles[0].text;
+
+async function legacyPair(root, records = [message(21)]) {
+    const context = {
+        module: { exports: {} },
+        require: name => name === "electron" ? {
+            app: { getPath: kind => { assert.equal(kind, "documents"); return root; } }
+        } : require(name)
+    };
+    vm.runInNewContext(legacyCode, context);
+    let result;
+    for (const record of records) result = await context.module.exports.appendLiveMessage(null, record);
+    assert.equal(result.directory, path.join(root, "VesktopChatLogs", `Fixture_${id(3)}`));
+    assert.ok(!(await fs.readFile(result.htmlPath, "utf8")).endsWith("</body></html>\n"));
+    return result;
+}
+
+async function pairBytes(result) {
+    return { txt: await fs.readFile(result.txtPath), html: await fs.readFile(result.htmlPath) };
+}
+
+async function assertPairPrefix(result, before) {
+    const after = await pairBytes(result);
+    const footer = Buffer.from("</body></html>\n");
+    // TXT never had a footer, so every old byte must remain an exact prefix.
+    assert.deepEqual(after.txt.subarray(0, before.txt.length), before.txt, "txt: every legacy byte stays in place");
+    // HTML keeps its closing footer last, and a rewrite relocates it instead of
+    // touching the articles in front of it.
+    const closed = before.html.subarray(before.html.length - footer.length).equals(footer);
+    const kept = closed ? before.html.subarray(0, before.html.length - footer.length) : before.html;
+    assert.deepEqual(after.html.subarray(0, kept.length), kept, "html: every legacy article byte stays in place");
+    assert.ok(after.html.subarray(after.html.length - footer.length).equals(footer), "html: the footer still closes the archive");
+}
+
 async function rows(result) {
     const txt = await fs.readFile(result.txtPath, "utf8");
     const html = await fs.readFile(result.htmlPath, "utf8");
@@ -48,6 +92,220 @@ async function rows(result) {
         html: [...html.matchAll(/<code>(\d+)<\/code>/g)].map(match => match[1])
     };
 }
+
+test("0b56999 live replay keeps both ID-less TXT and footerless HTML completely unchanged", () => fixture(async root => {
+    const first = await legacyPair(root);
+    const before = await pairBytes(first);
+    assert.equal(before.txt.toString("utf8").split("\n")[0], `[${message(21).timestamp}] fixture (${id(99)})`);
+    for (const record of [message(21), message(21, { content: "replacement must not win" })]) {
+        const result = await loadArchive(root).writeLiveArchive(root, record);
+        assert.equal(result.txtPath, first.txtPath);
+        assert.equal(result.htmlPath, first.htmlPath);
+        assert.equal(result.count, 1);
+        assert.deepEqual(await pairBytes(result), before);
+    }
+    assert.ok(!(await fs.readdir(first.directory)).some(name => name.endsWith(".stage")));
+}));
+
+test("0b56999 later ID appends at the same paths preserving every existing TXT and HTML byte", () => fixture(async root => {
+    const content = `row 21\r\n日本語 & <article>\n\n[2026-01-01T00:00:00.000Z] fixture (${id(99)}) [${id(22)}]\nnot a message\n[2026-01-01T00:00:00.000Z] fixture (${id(99)})\nstill body`;
+    const first = await legacyPair(root, [message(21, {
+        content, attachments: [{ filename: "添付.txt", url: "https://example.invalid/file?x=1&y=2" }]
+    })]);
+    const before = await pairBytes(first);
+    const archive = loadArchive(root, {
+        readFile: async () => assert.fail("legacy archive bodies must stream"),
+        appendFile: async (file, data, ...args) => {
+            assert.ok(!Buffer.isBuffer(data), "ascending legacy append must not rebuild earlier bodies");
+            return fs.appendFile(file, data, ...args);
+        }
+    });
+    const result = await archive.writeLiveArchive(root, message(22));
+    assert.equal(result.txtPath, first.txtPath);
+    assert.equal(result.htmlPath, first.htmlPath);
+    assert.equal(result.count, 2, "the header-shaped body must not reserve the future ID");
+    await assertPairPrefix(result, before);
+    assert.deepEqual((await rows(result)).html, [id(21), id(22)]);
+    assert.deepEqual((await rows(result)).txt, [21, 22]);
+    const mixed = await pairBytes(result);
+    for (const n of [21, 22]) {
+        await loadArchive(root).writeLiveArchive(root, message(n, { content: "replacement" }));
+        assert.deepEqual(await pairBytes(result), mixed);
+    }
+}));
+
+test("mixed live archives append only newer IDs and keep the immutable 0b56999 prefix byte-exact", () => fixture(async root => {
+    const first = await legacyPair(root, [message(21, { content: "row 21\n" + "あ".repeat(100000) })]);
+    const before = await pairBytes(first);
+    let copied = 0;
+    const archive = loadArchive(root, {
+        readFile: async () => assert.fail("whole-file legacy reads forbidden"),
+        appendFile: async (file, data, ...args) => {
+            if (Buffer.isBuffer(data)) copied = Math.max(copied, data.length);
+            return fs.appendFile(file, data, ...args);
+        }
+    });
+    const result = await archive.writeLiveArchive(root, message(23));
+    assert.equal(result.count, 2);
+    assert.equal(copied, 0, "a newer ID is appended in place, not copied through a staged rebuild");
+    await assertPairPrefix(result, before);
+    assert.deepEqual((await rows(result)).txt, [21, 23]);
+    assert.deepEqual((await rows(result)).html, [id(21), id(23)]);
+    const mixed = await pairBytes(result);
+    await assert.rejects(() => loadArchive(root).writeLiveArchive(root, message(22)), /Legacy live archive order conflict/);
+    assert.deepEqual(await pairBytes(result), mixed);
+    for (const n of [21, 23]) {
+        await loadArchive(root).writeLiveArchive(root, message(n, { content: "replacement" }));
+        assert.deepEqual(await pairBytes(result), mixed);
+    }
+}));
+
+test("out-of-order 0b56999 articles replay unchanged and block new saves rather than silently sorting old bytes", () => fixture(async root => {
+    const first = await legacyPair(root, [message(22), message(21)]);
+    const before = await pairBytes(first);
+    for (const n of [21, 22]) {
+        const result = await loadArchive(root).writeLiveArchive(root, message(n));
+        assert.equal(result.count, 2);
+        assert.deepEqual(await pairBytes(result), before);
+    }
+    await assert.rejects(() => loadArchive(root).writeLiveArchive(root, message(23)), /Legacy live archive order conflict/);
+    assert.deepEqual(await pairBytes(first), before);
+    assert.deepEqual((await rows(first)).html, [id(22), id(21)]);
+}));
+
+test("a new ID inside the immutable 0b56999 range is blocked without conversion or reordering", () => fixture(async root => {
+    const first = await legacyPair(root, [message(21), message(23)]);
+    const before = await pairBytes(first);
+    for (const n of [20, 22]) {
+        await assert.rejects(() => loadArchive(root).writeLiveArchive(root, message(n)), /Legacy live archive order conflict/);
+        assert.deepEqual(await pairBytes(first), before);
+    }
+}));
+
+test("legacy HTML append failure restores the exact footerless ID-less pair before another ID", () => fixture(async root => {
+    const first = await legacyPair(root);
+    const before = await pairBytes(first);
+    let fail = true;
+    const archive = loadArchive(root, {
+        appendFile: async (file, data, ...args) => {
+            if (fail && String(file).endsWith(".html")) {
+                fail = false;
+                await fs.appendFile(file, "partial", ...args);
+                throw new Error("synthetic legacy append EIO");
+            }
+            return fs.appendFile(file, data, ...args);
+        }
+    });
+    await assert.rejects(() => archive.writeLiveArchive(root, message(22)), /synthetic legacy append EIO/);
+    assert.deepEqual(await pairBytes(first), before);
+    assert.ok(!(await fs.readdir(first.directory)).some(name => name.endsWith(".stage")));
+    const result = await loadArchive(root).writeLiveArchive(root, message(23));
+    await assertPairPrefix(result, before);
+    assert.deepEqual((await rows(result)).html, [id(21), id(23)]);
+}));
+
+test("mixed legacy append failure rolls back both files before the next newer ID", () => fixture(async root => {
+    const first = await legacyPair(root);
+    await loadArchive(root).writeLiveArchive(root, message(23));
+    const before = await pairBytes(first);
+    let fail = true;
+    const archive = loadArchive(root, {
+        appendFile: async (file, data, ...args) => {
+            if (fail && String(file).endsWith(".html")) {
+                fail = false;
+                await fs.appendFile(file, "partial", ...args);
+                throw new Error("synthetic mixed append EIO");
+            }
+            return fs.appendFile(file, data, ...args);
+        }
+    });
+    await assert.rejects(() => archive.writeLiveArchive(root, message(24)), /synthetic mixed append EIO/);
+    assert.deepEqual(await pairBytes(first), before);
+    assert.ok(!(await fs.readdir(first.directory)).some(name => name.endsWith(".stage")));
+    const result = await loadArchive(root).writeLiveArchive(root, message(24));
+    await assertPairPrefix(result, before);
+    assert.deepEqual((await rows(result)).html, [id(21), id(23), id(24)]);
+}));
+
+test("legacy per-path queue holds through failed append cleanup and rejects older IDs", () => fixture(async root => {
+    const first = await legacyPair(root);
+    const before = await pairBytes(first);
+    let active = 0, maxActive = 0, fail = true;
+    const archive = loadArchive(root, {
+        appendFile: async (file, data, ...args) => {
+            active++;
+            maxActive = Math.max(maxActive, active);
+            try {
+                await new Promise(resolve => setTimeout(resolve, 5));
+                if (fail && String(file).endsWith(".html")) {
+                    fail = false;
+                    await fs.appendFile(file, "partial", ...args);
+                    throw new Error("synthetic queued legacy append EIO");
+                }
+                return await fs.appendFile(file, data, ...args);
+            } finally { active--; }
+        }
+    });
+    const outcomes = await Promise.allSettled([22, 23, 24, 23].map(n => archive.writeLiveArchive(root, message(n))));
+    assert.equal(outcomes[0].status, "rejected");
+    assert.match(outcomes[0].reason.message, /synthetic queued legacy append EIO/);
+    assert.ok(outcomes.slice(1).every(outcome => outcome.status === "fulfilled"));
+    assert.equal(maxActive, 1);
+    await assertPairPrefix(first, before);
+    assert.deepEqual((await rows(first)).html, [id(21), id(23), id(24)]);
+    assert.deepEqual((await rows(first)).txt, [21, 23, 24]);
+}));
+
+test("current ID-bearing archives without the required HTML footer are not accepted as legacy on replay or append", () => fixture(async root => {
+    const first = await loadArchive(root).writeLiveArchive(root, message(21));
+    const html = await fs.readFile(first.htmlPath);
+    await fs.writeFile(first.htmlPath, html.subarray(0, html.length - Buffer.byteLength("</body></html>\n")));
+    const before = await pairBytes(first);
+    for (const n of [21, 22]) {
+        await assert.rejects(() => loadArchive(root).writeLiveArchive(root, message(n)), /Invalid live HTML footer/);
+        assert.deepEqual(await pairBytes(first), before);
+    }
+}));
+
+test("a current TXT ID removed while its HTML footer remains is corruption, not a legacy header", () => fixture(async root => {
+    const first = await loadArchive(root).writeLiveArchive(root, message(21));
+    await fs.writeFile(first.txtPath, (await fs.readFile(first.txtPath, "utf8")).replace(` [${id(21)}]\n`, "\n"));
+    const before = await pairBytes(first);
+    for (const n of [21, 22]) {
+        await assert.rejects(() => loadArchive(root).writeLiveArchive(root, message(n)), /Invalid live TXT\/HTML boundary/);
+        assert.deepEqual(await pairBytes(first), before);
+    }
+}));
+
+test("legacy detection rejects malformed IDs, trailing TXT, missing separators and broken or junk HTML", () => fixture(async root => {
+    for (const corrupt of [
+        async result => fs.writeFile(result.txtPath, (await fs.readFile(result.txtPath, "utf8")).replace(`(${id(99)})\n`, `(${id(99)}) [broken]\n`)),
+        async result => fs.appendFile(result.txtPath, "unindexed bytes\n"),
+        async result => fs.writeFile(result.txtPath, (await fs.readFile(result.txtPath, "utf8")).slice(0, -1)),
+        async result => fs.writeFile(result.txtPath, (await fs.readFile(result.txtPath, "utf8")).slice(0, -1) + "not blank\n"),
+        async result => fs.writeFile(result.htmlPath, (await fs.readFile(result.htmlPath, "utf8")).replace("</article>\n", "</artic")),
+        async result => fs.appendFile(result.htmlPath, "</body></ht"),
+        async result => fs.appendFile(result.htmlPath, "unexpected bytes\n"),
+        async result => fs.writeFile(result.txtPath, (await fs.readFile(result.txtPath, "utf8")).replace(`(${id(99)})\n`, `(${id(99)}) [${id(22)}]\n`))
+    ]) {
+        const first = await legacyPair(root);
+        await corrupt(first);
+        const before = await pairBytes(first);
+        for (const n of [21, 22]) {
+            await assert.rejects(() => loadArchive(root).writeLiveArchive(root, message(n)), /Invalid live|Incomplete live/);
+            assert.deepEqual(await pairBytes(first), before);
+        }
+        await fs.rm(first.directory, { recursive: true });
+    }
+}));
+
+test("ID-less TXT is allowed only in a leading legacy prefix, never after a current record", () => fixture(async root => {
+    const first = await legacyPair(root, [message(21), message(22)]);
+    await fs.writeFile(first.txtPath, (await fs.readFile(first.txtPath, "utf8")).replace(`(${id(99)})\n`, `(${id(99)}) [${id(21)}]\n`));
+    const before = await pairBytes(first);
+    await assert.rejects(() => loadArchive(root).writeLiveArchive(root, message(23)), /Invalid live TXT\/HTML boundary/);
+    assert.deepEqual(await pairBytes(first), before);
+}));
 
 test("new live archives persist only TXT and HTML, never JSON or another canonical body", () => fixture(async root => {
     const archive = loadArchive(root);
