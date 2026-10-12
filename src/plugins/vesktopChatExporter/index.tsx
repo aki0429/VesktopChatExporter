@@ -234,7 +234,7 @@ function renderExportStatus(status: ExportStatus) {
         statusPanel.setAttribute("role", "status");
         statusPanel.setAttribute("aria-live", "polite");
         Object.assign(statusPanel.style, {
-            position: "fixed", bottom: "16px", right: "16px", zIndex: "1000",
+            position: "fixed", top: "16px", right: "16px", zIndex: "1000",
             padding: "12px 16px", borderRadius: "8px", background: "var(--background-secondary, #232428)",
             color: "var(--text-normal, #fff)", fontSize: "13px", pointerEvents: "none",
             boxShadow: "0 2px 10px #0006", whiteSpace: "pre-line"
@@ -250,6 +250,19 @@ function renderExportStatus(status: ExportStatus) {
     };
     Object.assign(statusPanel.dataset, status, { percent });
     statusPanel.textContent = `チャット保存: ${phases[status.phase]}\n取得: ${status.completedChannels}/${status.totalChannels} チャンネル・${status.fetchedMessages} メッセージ\n組み立て: ${status.processedPages}/${status.totalPages} ページ (${percent}%)`;
+}
+// Keep the original acquisition notices at the top; the persistent panel is additional,
+// not a replacement for the notifications shown while a channel is being fetched.
+const progressToastOptions = () => ({ position: Toasts.Position.TOP });
+let lastProgressToastAt = 0;
+function notifyAcquisitionProgress(status: ExportStatus, automatic = false, force = false) {
+    const now = Date.now();
+    if (!force && now - lastProgressToastAt < 5_000) return;
+    lastProgressToastAt = now;
+    const text = automatic
+        ? `自動履歴収集: 保存 ${status.fetchedMessages} メッセージ（${status.processedPages}ページ）`
+        : `ログ取得: 取得済み ${status.completedChannels}/${status.totalChannels} チャンネル・保存 ${status.fetchedMessages} メッセージ`;
+    showToast(text, Toasts.Type.MESSAGE, progressToastOptions());
 }
 let exporting = false;
 let cancelled = false;
@@ -556,6 +569,7 @@ function buildContainers(): Container[] {
     return containers;
 }
 
+let automaticProgress: ExportStatus | undefined;
 const historyCrawler = createHistoryCrawler<RawMessage>({
     loadState: () => Native.loadCrawlState(),
     saveState: state => Native.saveCrawlState(state),
@@ -569,6 +583,11 @@ const historyCrawler = createHistoryCrawler<RawMessage>({
         const saved = await Native.saveHistoryPage(container.category, container.id, container.name, channel.id,
             channelLabel(channel), messages.map(message => toHistoryMessage(message, container, channel)));
         if (!saved || saved.count !== messages.length) throw new Error("History storage did not confirm the page");
+        if (automaticProgress && activeCrawlGeneration === crawlGeneration && !exporting && !pluginStopped) {
+            automaticProgress.fetchedMessages += saved.count;
+            automaticProgress.processedPages++;
+            notifyAcquisitionProgress(automaticProgress, true);
+        }
     },
     running: () => activeCrawlGeneration === crawlGeneration && !crawlStopped && !pluginStopped && !authFailed && settings.store.forceHistoryCrawl,
     manualActive: () => exporting,
@@ -593,12 +612,17 @@ async function crawlAllHistory() {
     crawlRunning = true;
     const generation = crawlGeneration;
     activeCrawlGeneration = generation;
+    const status: ExportStatus = { phase: "fetching", completedChannels: 0, totalChannels: 0,
+        fetchedMessages: 0, processedPages: 0, totalPages: 0 };
+    automaticProgress = status;
     let result: CrawlResult | undefined;
     try {
         if (!pluginStopped && !authFailed) result = await historyCrawler.run();
     } finally {
+        if (automaticProgress === status) automaticProgress = undefined;
         crawlRunning = false;
         if (generation !== crawlGeneration) return;
+        if (!exporting && status.fetchedMessages) notifyAcquisitionProgress(status, true, true);
         const delay = nextHistoryDelay({ canSchedule: !crawlStopped && !pluginStopped && !authFailed,
             enabled: settings.store.forceHistoryCrawl, manualActive: exporting, yielded: result?.yielded, bounded: result?.bounded });
         if (delay !== undefined) crawlTimer = setTimeout(crawlAllHistory, delay);
@@ -820,7 +844,7 @@ async function exportChannels(container: Container, label: string) {
         fetched = progress.reduce((sum, entry) => sum + entry.messages, 0);
         const opened = await Native.beginExport(container.category, base, JSON.stringify({ ...manifest, phase: "fetching", outcome: "running", fetched, revoked, progress }));
         await checkpoint("fetching");
-        showToast(`${label}: ${channels.length}件の取得${pending ? "を途中から再開" : "を開始"}（逐次保存）`, Toasts.Type.MESSAGE);
+        showToast(`${label}: ${channels.length}件の取得${pending ? "を途中から再開" : "を開始"}（逐次保存）`, Toasts.Type.MESSAGE, progressToastOptions());
         // Phase 1: walk every channel and serialise each page to storage as it arrives. No page is
         // ever kept in memory after it has been written, so the run is bounded by the largest page
         // rather than by the size of the server, and a crash keeps everything already fetched.
@@ -843,7 +867,7 @@ async function exportChannels(container: Container, label: string) {
             if (!entry) { entry = { channel, pages: [], messages: 0 }; progress.push(entry); }
             const pages = entry.pages;
             if (entry.completed) { walked.push(entry); continue; }
-            showToast(`[${i + 1}/${channels.length}] ${name} を取得中`, Toasts.Type.MESSAGE);
+            showToast(`[${i + 1}/${channels.length}] ${name} を取得中`, Toasts.Type.MESSAGE, progressToastOptions());
             try {
                 entry.completed = await walkChannelHistory(channel, allowed, async page => {
                     const stored = await Native.writeHistoryPageJson(container.category, base, channel.id, name, page.map(message => toHistoryMessage(message, container, channel)));
@@ -854,10 +878,12 @@ async function exportChannels(container: Container, label: string) {
                     fetched += page.length;
                     updateStatus();
                     await checkpoint("fetching");
-                    if (fetched % 500 === 0) showToast(`${name}: 累計${fetched}件保存`, Toasts.Type.MESSAGE);
+                    notifyAcquisitionProgress(status);
+                    if (fetched % 500 === 0) showToast(`${name}: 累計${fetched}件保存`, Toasts.Type.MESSAGE, progressToastOptions());
                 }, entry.before);
                 updateStatus();
                 await checkpoint("fetching");
+                if (entry.completed) notifyAcquisitionProgress(status, false, true);
             } catch (error) {
                 // Access revoked while this channel was being walked: discard this run's pages for it
                 // instead of reporting a named failure.

@@ -33,7 +33,7 @@ export function loadPlugin({ channels = [], guilds = [], users = [], privateChan
         SelectedGuildStore: { getGuildId: () => undefined },
         RestAPI: { get: async options => { requests.push(options); return rest ? rest(options) : { body: [] }; } },
         FluxDispatcher: { subscribe() {}, unsubscribe() {} },
-        showToast: (...args) => toasts.push(args), Toasts: { Type: { MESSAGE: "message", SUCCESS: "success", FAILURE: "failure" } }
+        showToast: (...args) => toasts.push(args), Toasts: { Type: { MESSAGE: "message", SUCCESS: "success", FAILURE: "failure" }, Position: { TOP: 0, BOTTOM: 1 } }
     };
     // An in-memory disk: helpers write into it exactly like the native side does on real files, so
     // tests can read back what a run actually stored instead of one final buffered value.

@@ -41,6 +41,27 @@ function cancel(app) {
     children.find(item => item?.props?.id === "vc-cancel-guild-export").props.action();
 }
 
+test("manual acquisition progress stays at the top and uses top notifications", async () => {
+    const app = fixture(options());
+    await app.hooks.exportGuild(guild);
+    assert.equal(app.panel().style.top, "16px", "progress belongs at the top, not the bottom");
+    assert.ok(!app.panel().style.bottom);
+    const notices = app.toasts.filter(([text]) => text.includes("取得"));
+    assert.ok(notices.length > 0);
+    assert.ok(notices.every(([, , options]) => options?.position === 0), "acquisition notices must explicitly use TOP");
+    assert.ok(app.toasts.some(([text, , options]) => /保存.*102/.test(text) && options?.position === 0), "durably stored message count is visible at the top");
+});
+
+test("background acquisition emits top progress only for confirmed pages", async () => {
+    const dm = { id: id(400), type: 1 };
+    const app = fixture({ channels: [dm], rest: () => ({ body: [message(401)] }) });
+    await app.hooks.crawlAllHistory();
+    assert.ok(app.toasts.some(([text, , options]) => /自動履歴収集.*保存.*1.*メッセージ/.test(text) && options?.position === 0));
+    const failed = fixture({ channels: [dm], rest: () => ({ body: [message(401)] }), native: { saveHistoryPage: async () => { throw new Error("disk unavailable"); } } });
+    await failed.hooks.crawlAllHistory();
+    assert.ok(!failed.toasts.some(([text]) => /自動履歴収集.*保存.*1.*メッセージ/.test(text)), "failed page cannot appear as saved progress");
+});
+
 test("discovery cancellation and startup storage failure are explicit terminal states", async () => {
     const stopped = fixture(options());
     const load = stopped.native.loadPendingExport;
