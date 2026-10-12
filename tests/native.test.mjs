@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { buildSync } from "esbuild";
 import vm from "node:vm";
 import { createRequire } from "node:module";
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { id, loadPlugin } from "./harness.mjs";
@@ -22,6 +22,42 @@ const part = (channelId, n, channelName = "chrono") => ({
     guildId: id(3), guildName: "Fixture", channelId, channelName,
     messageId: id(n), timestamp: `2026-01-01T00:00:${String(n).padStart(2, "0")}.000Z`,
     author: "fixture", authorId: id(21), content: `chrono ${n}`, attachments: []
+});
+
+test("all-chat JSON contains full chat content rather than an ID-only progress record", async () => {
+    const dir = await mkdtemp(path.join(process.env.TMPDIR, "vesktop-chat-json-"));
+    try {
+        const native = await loadNative(dir);
+        const channel = id(5);
+        const page = [part(channel, 12), { ...part(channel, 11), content: '本文のfixture\n<embedded text>',
+            attachments: [{ filename: 'fixture.png', url: 'https://example.invalid/fixture.png' }] }, part(channel, 10)];
+        const saved = await native.writeHistoryPageJson(null, undefined, 'fixture-in-progress', channel, "chrono", page);
+        assert.ok(saved.path.endsWith('.json'), 'the chat archive itself must be a normal JSON document');
+        const stored = JSON.parse(await readFile(saved.path, 'utf8'));
+        assert.deepEqual(stored, [...page].reverse());
+        assert.equal(stored[1].content, '本文のfixture\n<embedded text>');
+        assert.equal(stored[1].author, 'fixture');
+        assert.equal(stored[1].timestamp, page[1].timestamp);
+        assert.deepEqual(stored[1].attachments, page[1].attachments);
+        assert.deepEqual(await readdir(path.dirname(saved.path)), [saved.base + '.json'], 'do not add unsolicited TXT/HTML sidecars');
+        await native.purgeChannelPages(null, undefined, 'fixture-in-progress', channel);
+        await assert.rejects(() => readFile(saved.path, 'utf8'));
+    } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("new content JSON and old JSONL pages can resume together without duplicate listing", async () => {
+    const dir = await mkdtemp(path.join(process.env.TMPDIR, 'vesktop-json-compat-'));
+    try {
+        const native = await loadNative(dir), channel = id(5), run = 'fixture-json-compat';
+        const saved = await native.writeHistoryPageJson(null, undefined, run, channel, 'chrono', [part(channel, 10), part(channel, 11)]);
+        const legacy = saved.path.replace(/\.json$/, '.jsonl');
+        await writeFile(legacy, [part(channel, 10), part(channel, 11)].map(m => JSON.stringify(m)).join('\n') + '\n');
+        assert.deepEqual([...await native.listHistoryPages(null, undefined, run, channel, 'chrono')], [saved.base]);
+        await rm(saved.path);
+        assert.deepEqual([...(await native.readHistoryPage(null, undefined, run, channel, 'chrono', saved.base)).map(m => m.content)], ['chrono 10', 'chrono 11']);
+        await native.discardHistoryPages(null, undefined, run, channel, 'chrono', [saved.base]);
+        await assert.rejects(() => readFile(legacy));
+    } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("history chunks are stored oldest-first so the archive reads chronologically", async () => {
@@ -100,7 +136,7 @@ test("per-page JSON parts are written as each page arrives, listed oldest-first 
 
         assert.equal(first.base, `${id(10)}_${id(12)}`);
         assert.match(first.path, /\.parts/);
-        const lines = (await readFile(first.path, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+        const lines = JSON.parse(await readFile(first.path, "utf8"));
         assert.deepEqual(lines.map(message => message.messageId), [id(10), id(11), id(12)]);
 
         // Spread the arrays: values built inside the plugin's realm are not reference-equal.

@@ -324,10 +324,10 @@ export async function writeHistoryPageJson(
     const directory = partsDir(category, baseName, channelId, channelName);
     await mkdir(directory, { recursive: true });
     const base = `${ordered[0].messageId}_${ordered[ordered.length - 1].messageId}`;
-    const path = join(directory, `${base}.jsonl`);
+    const path = join(directory, `${base}.json`);
     const temporary = `${path}.tmp`;
     try {
-        await writeFile(temporary, `${ordered.map(message => JSON.stringify(message)).join("\n")}\n`, "utf8");
+        await writeFile(temporary, `${JSON.stringify(ordered, null, 2)}\n`, "utf8");
         await rename(temporary, path);
     } finally { await rm(temporary, { force: true }); }
     return { base, path, count: ordered.length };
@@ -346,8 +346,9 @@ export async function listHistoryPages(
     try { names = await readdir(directory); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
     return names
-        .filter(name => /^\d{17,20}_\d{17,20}\.jsonl$/.test(name))
-        .map(name => name.slice(0, -".jsonl".length))
+        .filter(name => /^\d{17,20}_\d{17,20}\.jsonl?$/.test(name))
+        .map(name => name.replace(/\.jsonl?$/, ""))
+        .filter((name, index, all) => all.indexOf(name) === index)
         .sort((left, right) => compareIds(left.split("_")[0], right.split("_")[0]));
 }
 
@@ -361,8 +362,16 @@ export async function readHistoryPage(
 ) {
     if (!/^\d{17,20}$/.test(channelId)) throw new Error("不正なチャンネルIDです");
     if (!/^\d{17,20}_\d{17,20}$/.test(base)) throw new Error("不正な履歴ページ名です");
-    const text = await readFile(join(partsDir(category, baseName, channelId, channelName), `${base}.jsonl`), "utf8");
-    const messages = text.split("\n").filter(line => line.trim()).map(line => JSON.parse(line) as HistoryMessage);
+    const directory = partsDir(category, baseName, channelId, channelName);
+    let messages: HistoryMessage[];
+    try {
+        messages = JSON.parse(await readFile(join(directory, `${base}.json`), "utf8"));
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        const text = await readFile(join(directory, `${base}.jsonl`), "utf8");
+        messages = text.split("\n").filter(line => line.trim()).map(line => JSON.parse(line) as HistoryMessage);
+    }
+    if (!Array.isArray(messages)) throw new Error("Invalid stored chat JSON");
     if (!messages.length || messages.length > 100 || messages.some(message => !/^\d{17,20}$/.test(message.messageId) || message.channelId !== channelId)
         || new Set(messages.map(message => message.messageId)).size !== messages.length
         || messages.some((message, index) => index > 0 && compareIds(messages[index - 1].messageId, message.messageId) >= 0)
@@ -398,7 +407,7 @@ export async function discardHistoryPages(
     let removed = 0;
     for (const base of bases) {
         if (!/^\d{17,20}_\d{17,20}$/.test(base)) continue;
-        await rm(join(directory, `${base}.jsonl`), { force: true });
+        await drainWrites([".json", ".jsonl"].map(extension => rm(join(directory, `${base}${extension}`), { force: true })));
         removed++;
     }
     // Removing only the files still leaves a private channel's id/name in its folder. rmdir is

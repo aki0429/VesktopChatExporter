@@ -99,7 +99,7 @@ test("purging a revoked channel deletes orphan pages from a crash before its che
 test("partial page write plus permission revocation removes untracked private data", async () => {
     let managed = true, injected = false;
     const disk = await fixture({ writeFile: async (file, data, ...args) => {
-        if (!injected && String(file).replaceAll('\\', '/').includes(`/${id(2)}/`) && String(file).endsWith('.jsonl.tmp')) {
+        if (!injected && String(file).replaceAll('\\', '/').includes(`/${id(2)}/`) && String(file).endsWith('.json.tmp')) {
             injected = true;
             await fs.writeFile(file, String(data).slice(0, 200), ...args);
             managed = false;
