@@ -20,6 +20,7 @@ const message = (n, overrides = {}) => ({
 
 function loadArchive(root, overrides = {}, globals = {}) {
     const context = {
+        Buffer,
         ...globals,
         module: { exports: {} },
         require: name => {
@@ -48,6 +49,26 @@ async function rows(result) {
     };
 }
 
+test("new live archives persist only TXT and HTML, never JSON or another canonical body", () => fixture(async root => {
+    const archive = loadArchive(root);
+    await archive.writeLiveArchive(root, message(22));
+    const result = await archive.writeLiveArchive(root, message(21));
+    assert.deepEqual((await fs.readdir(result.directory)).sort(), ["2026-01-01.html", "2026-01-01.txt"]);
+}));
+
+test("TXT body header lookalikes never become archive IDs", () => fixture(async root => {
+    for (const fake of [id(50), id(21), id(22)]) {
+        const content = `row 21\n\n[2026-01-01T00:00:00.000Z] fixture (${id(99)}) [${fake}]\nnot a message`;
+        const first = await loadArchive(root).writeLiveArchive(root, message(21, { content }));
+        const before = await fs.readFile(first.txtPath);
+        const result = await loadArchive(root).writeLiveArchive(root, message(22));
+        assert.equal(result.count, 2);
+        assert.deepEqual((await fs.readFile(result.txtPath)).subarray(0, before.length), before);
+        assert.deepEqual((await rows(result)).html, [id(21), id(22)]);
+        await fs.rm(first.directory, { recursive: true });
+    }
+}));
+
 test("reverse live arrival is published oldest-first in both formats", () => fixture(async root => {
     const archive = loadArchive(root);
     await archive.writeLiveArchive(root, message(22));
@@ -64,76 +85,44 @@ test("reloading with the same live payload never publishes a second copy", () =>
     assert.deepEqual((await rows(result)).txt, [21]);
 }));
 
-test("reload deduplicates the canonical ID without replacing its first payload or stable path", () => fixture(async root => {
+test("reload preserves first payload and stable ID paths", () => fixture(async root => {
     const first = await loadArchive(root).writeLiveArchive(root, message(21));
     const again = await loadArchive(root).writeLiveArchive(root, message(21, {
-        guildName: "renamed server", channelName: "renamed channel", content: "replacement must not win"
+        guildName: "renamed", channelName: "renamed", content: "replacement must not win"
     }));
     assert.equal(again.txtPath, first.txtPath);
-    assert.equal(again.htmlPath, first.htmlPath);
-    assert.deepEqual((await rows(again)).txt, [21]);
-    assert.deepEqual((await rows(again)).html, [id(21)]);
     assert.equal(again.count, 1);
-    const records = path.join(again.directory, "2026-01-01.records");
-    assert.deepEqual(await fs.readdir(records), [`${id(21)}.json`]);
-    assert.equal(JSON.parse(await fs.readFile(path.join(records, `${id(21)}.json`), "utf8")).content, "row 21");
+    assert.deepEqual((await rows(again)).txt, [21]);
+    assert.ok(!(await fs.readFile(again.htmlPath, "utf8")).includes("replacement must not win"));
 }));
 
-test("a crash-left hard-linked record stage cannot overwrite the canonical first payload", () => fixture(async root => {
+test("a crash-left hard-linked TXT stage cannot overwrite first payload", () => fixture(async root => {
     const first = await loadArchive(root).writeLiveArchive(root, message(21));
-    const recordPath = path.join(first.directory, "2026-01-01.records", `${id(21)}.json`);
-    await fs.link(recordPath, `${recordPath}.stage`);
-    const result = await loadArchive(root).writeLiveArchive(root, message(21, { content: "retry payload must not win" }));
-    assert.equal(JSON.parse(await fs.readFile(recordPath, "utf8")).content, "row 21");
+    await fs.link(first.txtPath, `${first.txtPath}.stage`);
+    const result = await loadArchive(root).writeLiveArchive(root, message(21, { content: "replacement" }));
     assert.deepEqual((await rows(result)).txt, [21]);
 }));
 
-test("partial canonical writes stay nonfinal and the same ID is retryable", () => fixture(async root => {
+test("partial TXT stage writes stay nonfinal and the same ID is retryable", () => fixture(async root => {
     let fail = true;
     const archive = loadArchive(root, {
         writeFile: async (file, data, ...args) => {
-            if (fail && String(file).endsWith(`${id(21)}.json.stage`)) {
+            if (fail && String(file).endsWith(".txt.stage")) {
                 fail = false;
-                await fs.writeFile(file, '{"partial":', ...args);
-                throw new Error("synthetic interrupted canonical write");
+                await fs.writeFile(file, "partial", ...args);
+                throw new Error("synthetic interrupted TXT write");
             }
             return fs.writeFile(file, data, ...args);
         }
     });
-    await assert.rejects(() => archive.writeLiveArchive(root, message(21)), /synthetic interrupted canonical write/);
+    await assert.rejects(() => archive.writeLiveArchive(root, message(21)), /synthetic interrupted TXT write/);
     const directory = path.join(root, "VesktopChatLogs", "Live", id(3), id(5));
-    assert.deepEqual(await fs.readdir(path.join(directory, "2026-01-01.records")), []);
-    await assert.rejects(() => fs.stat(path.join(directory, "2026-01-01.txt")));
+    assert.deepEqual(await fs.readdir(directory), []);
     const result = await archive.writeLiveArchive(root, message(21));
-    assert.equal(result.count, 1);
     assert.deepEqual((await rows(result)).txt, [21]);
 }));
 
-test("a rejected append never counts canonical existence as TXT/HTML success and reload repairs it", () => fixture(async root => {
-    let fail = false;
-    const archive = loadArchive(root, {
-        appendFile: async (file, data, ...args) => {
-            if (fail && String(file).endsWith(".html")) {
-                fail = false;
-                await fs.appendFile(file, '<article>partial', ...args);
-                throw new Error("synthetic partial HTML append");
-            }
-            return fs.appendFile(file, data, ...args);
-        }
-    });
-    const first = await archive.writeLiveArchive(root, message(21));
-    fail = true;
-    await assert.rejects(() => archive.writeLiveArchive(root, message(22)), /synthetic partial HTML append/);
-    const recordPath = path.join(first.directory, "2026-01-01.records", `${id(22)}.json`);
-    assert.equal(JSON.parse(await fs.readFile(recordPath, "utf8")).messageId, id(22));
-    const result = await loadArchive(root).writeLiveArchive(root, message(22));
-    assert.equal(result.count, 2);
-    assert.deepEqual((await rows(result)).txt, [21, 22]);
-    assert.deepEqual((await rows(result)).html, [id(21), id(22)]);
-    assert.ok(!(await fs.readFile(result.htmlPath, "utf8")).includes('partial'));
-}));
-
-test("reload recovers an interrupted pair publication and ignores leftover stages", () => fixture(async root => {
+test("reload recovers interrupted pair publication using TXT/HTML and same ID retry", () => fixture(async root => {
     let fail = false;
     const archive = loadArchive(root, {
         rename: async (from, to) => {
@@ -148,11 +137,152 @@ test("reload recovers an interrupted pair publication and ignores leftover stage
     fail = true;
     await assert.rejects(() => archive.writeLiveArchive(root, message(21)), /synthetic second publication failure/);
     await fs.writeFile(`${first.txtPath}.stage`, "crash leftovers", "utf8");
-    await fs.writeFile(path.join(first.directory, "2026-01-01.records", `${id(23)}.json.stage`), '{"partial":', "utf8");
     const result = await loadArchive(root).writeLiveArchive(root, message(21));
     assert.equal(result.count, 2);
     assert.deepEqual((await rows(result)).txt, [21, 22]);
     assert.deepEqual((await rows(result)).html, [id(21), id(22)]);
+}));
+
+test("different ID proceeds after second pair rename fails", () => fixture(async root => {
+    let fail = false;
+    const archive = loadArchive(root, {
+        rename: async (from, to) => {
+            if (fail && String(from).endsWith(".html.stage")) {
+                fail = false;
+                throw new Error("synthetic HTML rename EIO");
+            }
+            return fs.rename(from, to);
+        }
+    });
+    const first = await archive.writeLiveArchive(root, message(22));
+    const txtBefore = await fs.readFile(first.txtPath);
+    const htmlBefore = await fs.readFile(first.htmlPath);
+    fail = true;
+    await assert.rejects(() => archive.writeLiveArchive(root, message(21)), /synthetic HTML rename EIO/);
+    const result = await archive.writeLiveArchive(root, message(23));
+    assert.deepEqual((await rows(result)).txt, [22, 23]);
+    assert.deepEqual((await rows(result)).html, [id(22), id(23)]);
+    assert.deepEqual((await fs.readFile(result.txtPath)).subarray(0, txtBefore.length), txtBefore);
+    assert.ok((await fs.readFile(result.htmlPath)).includes(htmlBefore.subarray(0, htmlBefore.length - 14)));
+    assert.deepEqual((await fs.readdir(result.directory)).sort(), ["2026-01-01.html", "2026-01-01.txt"]);
+}));
+
+test("multiline author is refused before touching files and cannot poison later saves", () => fixture(async root => {
+    for (const author of ['first\nsecond', 'first\r\nsecond']) {
+        const archive = loadArchive(root, { mkdir: async () => assert.fail('invalid author must not touch files') });
+        await assert.rejects(() => archive.writeLiveArchive(root, message(22, { author })), /Invalid live author/);
+    }
+    const result = await loadArchive(root).writeLiveArchive(root, message(23));
+    assert.deepEqual((await rows(result)).txt, [23]);
+}));
+
+test("partial rollback marker preparation never strands the old pair", () => fixture(async root => {
+    const first = await loadArchive(root).writeLiveArchive(root, message(22));
+    const before = await fs.readFile(first.txtPath);
+    let fail = true;
+    const archive = loadArchive(root, {
+        writeFile: async (file, data, ...args) => {
+            if (fail && String(file).includes(".rollback")) {
+                fail = false;
+                await fs.writeFile(file, "pa", ...args);
+                throw new Error("synthetic interrupted marker write");
+            }
+            return fs.writeFile(file, data, ...args);
+        }
+    });
+    await assert.rejects(() => archive.writeLiveArchive(root, message(21)), /synthetic interrupted marker write/);
+    const result = await loadArchive(root).writeLiveArchive(root, message(23));
+    assert.deepEqual((await rows(result)).txt, [22, 23]);
+    assert.deepEqual((await fs.readFile(result.txtPath)).subarray(0, before.length), before);
+}));
+
+test("ascending arrivals do not rebuild earlier TXT or HTML bodies", () => fixture(async root => {
+    const archive = loadArchive(root, {
+        appendFile: async (file, data, ...args) => {
+            assert.ok(!Buffer.isBuffer(data), "ascending write cannot copy earlier segments");
+            return fs.appendFile(file, data, ...args);
+        }
+    });
+    await archive.writeLiveArchive(root, message(21));
+    const result = await archive.writeLiveArchive(root, message(22));
+    assert.deepEqual((await rows(result)).txt, [21, 22]);
+    assert.deepEqual((await rows(result)).html, [id(21), id(22)]);
+    assert.match(await fs.readFile(result.htmlPath, "utf8"), /<\/body><\/html>\n$/);
+}));
+
+test("restart rolls back crash snapshots before accepting a different ID", () => fixture(async root => {
+    for (const phase of ["first rename", "both renames", "interrupted rollback", "first publication"]) {
+        const first = await loadArchive(root).writeLiveArchive(root, message(22));
+        const txtBefore = await fs.readFile(first.txtPath);
+        const htmlBefore = await fs.readFile(first.htmlPath);
+        await fs.copyFile(first.txtPath, `${first.txtPath}.backup.stage`);
+        await fs.copyFile(first.htmlPath, `${first.htmlPath}.backup.stage`);
+        await fs.writeFile(`${first.txtPath}.rollback.stage`, phase === "first publication" ? "empty\n" : "pair\n");
+        await fs.writeFile(first.txtPath, "uncommitted TXT");
+        if (phase !== "first rename") await fs.writeFile(first.htmlPath, "partial HTML restore");
+        const result = await loadArchive(root).writeLiveArchive(root, message(23));
+        assert.deepEqual((await rows(result)).txt, phase === "first publication" ? [23] : [22, 23]);
+        assert.deepEqual((await rows(result)).html, phase === "first publication" ? [id(23)] : [id(22), id(23)]);
+        if (phase !== "first publication") {
+            assert.deepEqual((await fs.readFile(result.txtPath)).subarray(0, txtBefore.length), txtBefore);
+            assert.ok((await fs.readFile(result.htmlPath)).includes(htmlBefore.subarray(0, htmlBefore.length - 14)));
+        }
+        assert.deepEqual((await fs.readdir(result.directory)).sort(), ["2026-01-01.html", "2026-01-01.txt"]);
+        await fs.rm(result.directory, { recursive: true });
+    }
+}));
+
+test("failed rollback preserves backups for the next different ID", () => fixture(async root => {
+    let failRename = false, failRestore = false;
+    const archive = loadArchive(root, {
+        rename: async (from, to) => {
+            if (failRename && String(from).endsWith(".html.stage")) {
+                failRename = false;
+                failRestore = true;
+                throw new Error("synthetic publication EIO");
+            }
+            return fs.rename(from, to);
+        },
+        copyFile: async (from, to, ...args) => {
+            if (failRestore && String(from).endsWith(".html.backup.stage")) {
+                failRestore = false;
+                await fs.writeFile(to, "partial restore");
+                throw new Error("synthetic restore EIO");
+            }
+            return fs.copyFile(from, to, ...args);
+        }
+    });
+    const first = await archive.writeLiveArchive(root, message(22));
+    failRename = true;
+    await assert.rejects(() => archive.writeLiveArchive(root, message(21)), /synthetic restore EIO/);
+    assert.ok((await fs.readdir(first.directory)).includes("2026-01-01.txt.rollback.stage"));
+    const result = await loadArchive(root).writeLiveArchive(root, message(23));
+    assert.deepEqual((await rows(result)).txt, [22, 23]);
+    assert.deepEqual((await rows(result)).html, [id(22), id(23)]);
+}));
+
+test("ascending HTML append failure rolls back before accepting another ID", () => fixture(async root => {
+    let fail = false;
+    const archive = loadArchive(root, {
+        appendFile: async (file, data, ...args) => {
+            if (fail && String(file).endsWith(".html")) {
+                fail = false;
+                await fs.appendFile(file, "partial", ...args);
+                throw new Error("synthetic append EIO");
+            }
+            return fs.appendFile(file, data, ...args);
+        }
+    });
+    const first = await archive.writeLiveArchive(root, message(21));
+    const txtBefore = await fs.readFile(first.txtPath);
+    const htmlBefore = await fs.readFile(first.htmlPath);
+    fail = true;
+    await assert.rejects(() => archive.writeLiveArchive(root, message(22)), /synthetic append EIO/);
+    assert.deepEqual(await fs.readFile(first.txtPath), txtBefore);
+    assert.deepEqual(await fs.readFile(first.htmlPath), htmlBefore);
+    const result = await archive.writeLiveArchive(root, message(23));
+    assert.deepEqual((await rows(result)).txt, [21, 23]);
+    assert.deepEqual((await rows(result)).html, [id(21), id(23)]);
 }));
 
 test("legacy daily files are never read, reordered or written", () => fixture(async root => {
@@ -204,24 +334,42 @@ test("day and channel keys isolate independent archives", () => fixture(async ro
     }
 }));
 
-test("rebuild reads and writes one canonical message at a time", () => fixture(async root => {
-    const initial = loadArchive(root);
-    await initial.writeLiveArchive(root, message(23));
-    await initial.writeLiveArchive(root, message(22));
-    const trace = [];
+test("rebuild copies bounded chunks without loading whole TXT/HTML bodies", () => fixture(async root => {
+    await loadArchive(root).writeLiveArchive(root, message(22, { content: "row 22\n" + "あ".repeat(100000) }));
+    let largest = 0;
     const archive = loadArchive(root, {
-        readFile: async (file, ...args) => {
-            if (/\d{17,20}\.json$/.test(String(file))) trace.push(`read:${path.basename(String(file))}`);
-            return fs.readFile(file, ...args);
-        },
+        readFile: async () => assert.fail("whole-file reads forbidden"),
         appendFile: async (file, data, ...args) => {
-            if (String(file).endsWith(".stage") && String(data).includes("row ")) trace.push(`write:${path.extname(String(file).slice(0, -6))}`);
+            if (Buffer.isBuffer(data)) largest = Math.max(largest, data.length);
             return fs.appendFile(file, data, ...args);
         }
     });
     const result = await archive.writeLiveArchive(root, message(21));
-    assert.deepEqual(trace, [21, 22, 23].flatMap(n => [`read:${id(n)}.json`, "write:.txt", "write:.html"]));
-    assert.equal(result.count, 3);
+    assert.equal(result.count, 2);
+    assert.ok(largest > 0 && largest <= 65536);
+    assert.deepEqual((await rows(result)).html, [id(21), id(22)]);
+}));
+
+test("CRLF middle insertion preserves every TXT byte", () => fixture(async root => {
+    const first = await loadArchive(root).writeLiveArchive(root, message(21, { content: "row 21\r\n日本語\r\nlast" }));
+    const prefix = await fs.readFile(first.txtPath);
+    await loadArchive(root).writeLiveArchive(root, message(23));
+    const suffix = (await fs.readFile(first.txtPath)).subarray(prefix.length);
+    const result = await loadArchive(root).writeLiveArchive(root, message(22));
+    const middle = Buffer.from(`[${message(22).timestamp}] fixture (${id(99)}) [${id(22)}]\nrow 22\n\n`);
+    assert.deepEqual(await fs.readFile(result.txtPath), Buffer.concat([prefix, middle, suffix]));
+    assert.deepEqual((await rows(result)).html, [id(21), id(22), id(23)]);
+}));
+
+test("restart rebuild preserves CRLF content byte-for-byte", () => fixture(async root => {
+    const first = await loadArchive(root).writeLiveArchive(root, message(22, { content: "row 22\r\n日本語\r\nlast" }));
+    await loadArchive(root).writeLiveArchive(root, message(23));
+    const before = await fs.readFile(first.txtPath, "utf8");
+    const result = await loadArchive(root).writeLiveArchive(root, message(21));
+    assert.ok((await fs.readFile(result.txtPath, "utf8")).endsWith(before));
+    assert.match(await fs.readFile(result.txtPath, "utf8"), /last\n\n\[2026-01-01T00:00:23/);
+    assert.deepEqual((await rows(result)).txt, [21, 22, 23]);
+    assert.deepEqual((await rows(result)).html, [id(21), id(22), id(23)]);
 }));
 
 test("HTML escapes every displayed field and never activates non-web attachment URLs", () => fixture(async root => {
@@ -242,72 +390,22 @@ test("HTML escapes every displayed field and never activates non-web attachment 
     assert.match(await fs.readFile(result.txtPath, "utf8"), /\[添付\] unsafe\.txt: javascript:bad\(\)/);
 }));
 
-test("an empty canonical listing fails closed instead of publishing a zero-message day", () => fixture(async root => {
-    const first = await loadArchive(root).writeLiveArchive(root, message(21));
-    const txtBefore = await fs.readFile(first.txtPath, "utf8");
-    const htmlBefore = await fs.readFile(first.htmlPath, "utf8");
-    const archive = loadArchive(root, { readdir: async () => [] });
-    await assert.rejects(() => archive.writeLiveArchive(root, message(21)));
-    assert.equal(await fs.readFile(first.txtPath, "utf8"), txtBefore);
-    assert.equal(await fs.readFile(first.htmlPath, "utf8"), htmlBefore);
-}));
-
-test("canonical contents must match the stable filename, channel and day before publishing", () => fixture(async root => {
+test("old JSON and JSONL are never read, removed or migrated", () => fixture(async root => {
     const first = await loadArchive(root).writeLiveArchive(root, message(22));
-    const txtBefore = await fs.readFile(first.txtPath, "utf8");
-    const htmlBefore = await fs.readFile(first.htmlPath, "utf8");
-    const recordPath = path.join(first.directory, "2026-01-01.records", `${id(22)}.json`);
-    for (const changed of [
-        { messageId: id(23) }, { channelId: id(6) }, { guildId: id(4) },
-        { timestamp: "2026-01-02T00:00:22.000Z" }, { attachments: undefined }
-    ]) {
-        await fs.writeFile(recordPath, JSON.stringify(message(22, changed)), "utf8");
-        await assert.rejects(() => loadArchive(root).writeLiveArchive(root, message(21)));
-        assert.equal(await fs.readFile(first.txtPath, "utf8"), txtBefore);
-        assert.equal(await fs.readFile(first.htmlPath, "utf8"), htmlBefore);
-    }
-    await fs.writeFile(recordPath, JSON.stringify(message(22)), "utf8");
-    const result = await loadArchive(root).writeLiveArchive(root, message(21));
-    assert.equal(result.count, 2);
-    assert.deepEqual((await rows(result)).txt, [21, 22]);
-}));
-
-test("normal ascending arrivals append without reading earlier canonical messages", () => fixture(async root => {
-    const recordReads = [];
+    const legacy = path.join(first.directory, "2026-01-01.records");
+    await fs.mkdir(legacy);
+    const files = [path.join(legacy, `${id(21)}.json`), path.join(first.directory, "legacy.jsonl")];
+    for (const file of files) await fs.writeFile(file, "synthetic legacy body");
     const archive = loadArchive(root, {
-        readFile: async (file, ...args) => {
-            if (/\d{17,20}\.json$/.test(String(file))) recordReads.push(path.basename(String(file)));
-            return fs.readFile(file, ...args);
+        readFile: async () => assert.fail("legacy reads forbidden"),
+        rm: async (file, ...args) => {
+            assert.ok(!files.includes(String(file)) && String(file) !== legacy);
+            return fs.rm(file, ...args);
         }
     });
-    await archive.writeLiveArchive(root, message(21));
-    recordReads.length = 0;
-    const result = await archive.writeLiveArchive(root, message(22));
-    assert.ok(!recordReads.includes(`${id(21)}.json`), "ascending fast path cannot reread the whole day");
-    assert.deepEqual((await rows(result)).txt, [21, 22]);
-    assert.equal(result.count, 2);
-    assert.match(await fs.readFile(result.htmlPath, "utf8"), /<\/body><\/html>\n$/);
-}));
-
-test("published metadata has a 5000-key LRU cap and an evicted day rebuilds safely", () => fixture(async root => {
-    const maps = [];
-    class TrackingMap extends Map {
-        constructor(...args) { super(...args); maps.push(this); }
-    }
-    const archive = loadArchive(root, {}, { Map: TrackingMap });
-    const first = await archive.writeLiveArchive(root, message(21));
-    const cache = maps.find(map => map.get(first.txtPath)?.count === 1);
-    assert.ok(cache, "metadata cache records successful publication");
-    for (let n = 0; n < 5000; n++) cache.set(`synthetic-key-${n}`, { count: 1 });
-    // A successful publication is the trim boundary; no synthetic disk contents
-    // are involved in exercising a large cache.
-    const other = await archive.writeLiveArchive(root, message(21, { channelId: id(6) }));
-    assert.ok(cache.size <= 5000, "cache cannot retain metadata for every historical day forever");
-    assert.ok(!cache.has(first.txtPath), "oldest day is evicted");
-    assert.ok(cache.has(other.txtPath), "most recently published day remains cached");
-    const result = await archive.writeLiveArchive(root, message(22));
-    assert.equal(result.count, 2);
-    assert.deepEqual((await rows(result)).txt, [21, 22]);
+    const result = await archive.writeLiveArchive(root, message(23));
+    assert.deepEqual((await rows(result)).txt, [22, 23]);
+    for (const file of files) assert.equal(await fs.readFile(file, "utf8"), "synthetic legacy body");
 }));
 
 test("same-day concurrent writes serialize the full operation including failure cleanup", () => fixture(async root => {
@@ -332,9 +430,9 @@ test("same-day concurrent writes serialize the full operation including failure 
     assert.ok(outcomes.slice(1).every(outcome => outcome.status === "fulfilled"));
     assert.equal(maxActive, 1, "the queue must not release before rejection and cleanup have settled");
     const result = outcomes[3].value;
-    assert.deepEqual((await rows(result)).txt, [21, 22, 23]);
-    assert.deepEqual((await rows(result)).html, [id(21), id(22), id(23)]);
-    assert.equal(result.count, 3);
+    assert.deepEqual((await rows(result)).txt, [21, 23]);
+    assert.deepEqual((await rows(result)).html, [id(21), id(23)]);
+    assert.equal(result.count, 2);
 }));
 
 test("a failed streamed rebuild leaves both published files intact and retries the same canonical ID", () => fixture(async root => {

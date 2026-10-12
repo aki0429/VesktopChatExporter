@@ -3,8 +3,10 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { appendFile, link, mkdir, readFile, readdir, rename, rm, stat, truncate, writeFile } from "fs/promises";
+import { createReadStream } from "fs";
+import { appendFile, copyFile, mkdir, open, rename, rm, stat, writeFile } from "fs/promises";
 import { join } from "path";
+
 
 export type LiveRecord = {
     category?: string;
@@ -40,10 +42,8 @@ function htmlHeader(message: LiveRecord) {
     return `<!doctype html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escapeHtml(message.guildName)} #${escapeHtml(message.channelName)}</title><style>body{max-width:1000px;margin:auto;padding:24px;background:#1e1f22;color:#dbdee1;font:14px system-ui}article{padding:10px;border-bottom:1px solid #34363b}.meta span,.meta code{color:#949ba4;font-size:11px}.content{margin:5px 0;line-height:1.5}a{display:block;color:#00a8fc;margin-top:4px}</style></head><body><h1>${escapeHtml(message.guildName)} / #${escapeHtml(message.channelName)}</h1>\n`;
 }
 
-type ArchivePaths = { directory: string; recordsDirectory: string; txtPath: string; htmlPath: string; };
 const queues = new Map<string, Promise<void>>();
-type PublishedState = { count: number; newest: string; txtSize: number; htmlSize: number; };
-const published = new Map<string, PublishedState>();
+type Segment = { start: number; end: number; lines?: number; };
 const HTML_FOOTER = "</body></html>\n";
 
 function recordDay(message: LiveRecord) {
@@ -52,6 +52,7 @@ function recordDay(message: LiveRecord) {
         || (message.category !== undefined && typeof message.category !== "string")
         || !Array.isArray(message.attachments)
         || message.attachments.some(a => !a || typeof a.filename !== "string" || typeof a.url !== "string")) throw new Error("Invalid live record");
+    if (/[\r\n]/.test(message.author) || /[\r\n]/.test(message.authorId)) throw new Error("Invalid live author");
     const date = new Date(message.timestamp);
     if (!Number.isFinite(date.getTime())) throw new Error("Invalid live timestamp");
     return date.toISOString().slice(0, 10);
@@ -59,103 +60,220 @@ function recordDay(message: LiveRecord) {
 
 export async function writeLiveArchive(documentsRoot: string, message: LiveRecord) {
     const day = recordDay(message);
-    // A new namespace leaves every legacy daily log untouched. Display names never
-    // participate in the key, so renaming a server/channel cannot split an archive.
     const category = message.category?.replace(/[\\/:*?"<>|]/g, "_").replace(/[. ]+$/g, "").slice(0, 180);
     const directory = join(documentsRoot, "VesktopChatLogs", ...(category ? [category] : []), "Live", message.guildId, message.channelId);
-    const paths = {
-        directory,
-        recordsDirectory: join(directory, `${day}.records`),
-        txtPath: join(directory, `${day}.txt`),
-        htmlPath: join(directory, `${day}.html`)
-    };
-    const key = paths.txtPath;
-    const operation = (queues.get(key) ?? Promise.resolve()).then(() => writeArchive(paths, message)).catch(error => {
-        published.delete(key);
-        throw error;
-    });
-    // The queue tail includes rejection and finally cleanup, but cannot poison the
-    // following retry. The caller still observes the original failure.
+    const txtPath = join(directory, `${day}.txt`);
+    const htmlPath = join(directory, `${day}.html`);
+    const operation = (queues.get(txtPath) ?? Promise.resolve()).then(() => writeArchive(directory, txtPath, htmlPath, message));
     const tail = operation.then(() => {}, () => {});
-    queues.set(key, tail);
-    void tail.then(() => { if (queues.get(key) === tail) queues.delete(key); });
+    queues.set(txtPath, tail);
+    void tail.then(() => { if (queues.get(txtPath) === tail) queues.delete(txtPath); });
     return operation;
 }
 
-async function writeArchive({ directory, recordsDirectory, txtPath, htmlPath }: ArchivePaths, message: LiveRecord) {
-    await mkdir(recordsDirectory, { recursive: true });
-    const recordPath = join(recordsDirectory, `${message.messageId}.json`);
-    const recordStage = `${recordPath}.stage`;
-    let added = false;
+// Only IDs and byte ranges stay in memory. Existing human-readable files are
+// the only persisted source; legacy JSON and record directories are not opened.
+async function* byteLines(path: string) {
+    const input = createReadStream(path, { highWaterMark: 64 * 1024 });
+    let parts: Buffer[] = [];
+    let offset = 0;
     try {
-        // A crash after link() may leave the stage sharing the canonical inode.
-        // Unlink it before writing, never truncate the committed record via it.
-        await rm(recordStage, { force: true });
-        await writeFile(recordStage, `${JSON.stringify(message)}\n`, "utf8");
-        // Linking a complete stage is atomic and exclusive: a canonical ID can
-        // never be a half-written JSON file or be overwritten by a duplicate.
-        try { await link(recordStage, recordPath); added = true; }
-        catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        for await (const chunk of input) {
+            let start = 0;
+            for (let lf = chunk.indexOf(10, start); lf !== -1; lf = chunk.indexOf(10, start)) {
+                parts.push(chunk.subarray(start, lf));
+                const line = Buffer.concat(parts);
+                offset += line.length + 1;
+                yield { line: line.toString("utf8"), end: offset };
+                parts = [];
+                start = lf + 1;
+            }
+            if (start < chunk.length) parts.push(chunk.subarray(start));
         }
-    } finally {
-        await rm(recordStage, { force: true });
+        if (parts.length) {
+            const line = Buffer.concat(parts);
+            yield { line: line.toString("utf8"), end: offset + line.length };
+        }
+    } finally { input.destroy(); }
+}
+
+async function indexFile(path: string, html: boolean, expectedTxt?: Array<{ id: string; lines: number; }>) {
+    const entries = new Map<string, Segment>();
+    let size: number;
+    try { size = (await stat(path)).size; }
+    catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return entries;
+        throw error;
     }
 
-    const state = published.get(txtPath);
-    if (added && state && BigInt(message.messageId) > BigInt(state.newest)) {
-        let intact = false;
+    let offset = 0;
+    let pending: { id: string; start: number; } | undefined;
+    let remaining = 0;
+    {
+        for await (const { line, end } of byteLines(path)) {
+            if (html) {
+                if (line.startsWith("<article>")) {
+                    if (pending) throw new Error("Invalid live HTML article");
+                    const id = /<code>(\d{17,20})<\/code>/.exec(line)?.[1];
+                    if (!id || entries.has(id)) throw new Error("Invalid live HTML ID");
+                    pending = { id, start: offset };
+                    remaining = 1; // final blank line in TXT
+                }
+                if (pending) remaining += 1 + (line.match(/<br>/g)?.length ?? 0) + (line.match(/<a href=|<div>📎 /g)?.length ?? 0);
+                if (pending && line.endsWith("</article>")) {
+                    entries.set(pending.id, { start: pending.start, end, lines: remaining });
+                    pending = undefined;
+                }
+            } else {
+                // HTML supplies the exact number of body lines for each real
+                // article. Header-shaped content is never a boundary candidate.
+                const expected = expectedTxt?.[entries.size];
+                if (!pending && expected) {
+                    const id = /^\[[^\]\r\n]+\] .* \([^\r\n]*\) \[(\d{17,20})\]$/.exec(line)?.[1];
+                    if (id !== expected.id) throw new Error("Invalid live TXT/HTML boundary");
+                    pending = { id, start: offset };
+                    remaining = expected.lines;
+                } else if (pending && --remaining === 0) {
+                    entries.set(pending.id, { start: pending.start, end });
+                    pending = undefined;
+                }
+            }
+            offset = end;
+        }
+        if (pending) {
+            throw new Error("Incomplete live archive article");
+        }
+        if (!html && (offset !== size || entries.size !== expectedTxt?.length)) throw new Error("Invalid live TXT archive");
+    }
+    return entries;
+}
+
+async function copySegment(source: string, target: string, segment: Segment) {
+    const file = await open(source, "r");
+    try {
+        const buffer = Buffer.alloc(64 * 1024);
+        for (let position = segment.start; position < segment.end;) {
+            const { bytesRead } = await file.read(buffer, 0, Math.min(buffer.length, segment.end - position), position);
+            if (!bytesRead) throw new Error("Live archive changed during publication");
+            await appendFile(target, buffer.subarray(0, bytesRead));
+            position += bytesRead;
+        }
+    } finally { await file.close(); }
+}
+
+async function writeArchive(directory: string, txtPath: string, htmlPath: string, message: LiveRecord) {
+    await mkdir(directory, { recursive: true });
+    await recoverPair(txtPath, htmlPath);
+    const html = await indexFile(htmlPath, true);
+    const txt = await indexFile(txtPath, false, [...html].map(([id, segment]) => ({ id, lines: segment.lines! })));
+    const ids = new Set([...txt.keys(), ...html.keys(), message.messageId]);
+    for (const id of ids) {
+        if (id !== message.messageId && (!txt.has(id) || !html.has(id))) throw new Error("Incomplete live archive pair; retry the missing ID");
+    }
+    const ordered = [...ids].sort((a, b) => BigInt(a) < BigInt(b) ? -1 : 1);
+    if (txt.has(message.messageId) && html.has(message.messageId)) {
+        await rm(`${txtPath}.stage`, { force: true });
+        await rm(`${htmlPath}.stage`, { force: true });
+        return { directory, txtPath, htmlPath, count: ordered.length };
+    }
+    if (html.size && ordered[ordered.length - 1] === message.messageId) {
         try {
-            const txt = await stat(txtPath);
-            const html = await stat(htmlPath);
-            intact = txt.size === state.txtSize && html.size === state.htmlSize;
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-        }
-        if (intact) {
+            await prepareRollback(txtPath, htmlPath);
             await appendFile(txtPath, formatTxt(message), "utf8");
-            await truncate(htmlPath, state.htmlSize - HTML_FOOTER.length);
+            const file = await open(htmlPath, "r+");
+            try {
+                const size = (await file.stat()).size;
+                const footer = Buffer.alloc(Buffer.byteLength(HTML_FOOTER));
+                const { bytesRead } = await file.read(footer, 0, footer.length, size - footer.length);
+                if (bytesRead !== footer.length || footer.toString("utf8") !== HTML_FOOTER) throw new Error("Invalid live HTML footer");
+                await file.truncate(size - footer.length);
+            } finally { await file.close(); }
             await appendFile(htmlPath, formatHtml(message) + HTML_FOOTER, "utf8");
-            await rememberPublished(txtPath, htmlPath, state.count + 1, message.messageId);
-            return { directory, txtPath, htmlPath, count: state.count + 1 };
+            await rm(`${txtPath}.rollback.stage`, { force: true });
+        } catch (error) {
+            await recoverPair(txtPath, htmlPath);
+            throw error;
+        } finally {
+            await rm(`${txtPath}.rollback.prepare.stage`, { force: true });
+            if (!await exists(`${txtPath}.rollback.stage`)) {
+                await rm(`${txtPath}.backup.stage`, { force: true });
+                await rm(`${htmlPath}.backup.stage`, { force: true });
+            }
         }
+        return { directory, txtPath, htmlPath, count: ordered.length };
     }
-
-    const names = (await readdir(recordsDirectory)).filter(name => /^\d{17,20}\.json$/.test(name));
-    if (!names.length || !names.includes(`${message.messageId}.json`)) throw new Error("Canonical live record missing");
-    names.sort((left, right) => BigInt(left.slice(0, -5)) < BigInt(right.slice(0, -5)) ? -1 : 1);
     const txtStage = `${txtPath}.stage`;
     const htmlStage = `${htmlPath}.stage`;
     try {
+        // Unlink first: a crash-left hard link must not truncate a final file.
+        await rm(txtStage, { force: true });
+        await rm(htmlStage, { force: true });
         await writeFile(txtStage, "", "utf8");
         await writeFile(htmlStage, htmlHeader(message), "utf8");
-        // Only filenames are sorted in memory; each canonical message is parsed,
-        // formatted and released before the following record is read.
-        for (const name of names) {
-            const record = JSON.parse(await readFile(join(recordsDirectory, name), "utf8")) as LiveRecord;
-            if (recordDay(record) !== recordDay(message) || record.messageId !== name.slice(0, -5)
-                || record.guildId !== message.guildId || record.channelId !== message.channelId) throw new Error("Invalid canonical live record");
-            await appendFile(txtStage, formatTxt(record), "utf8");
-            await appendFile(htmlStage, formatHtml(record), "utf8");
+        for (const id of ordered) {
+            if (txt.has(id)) await copySegment(txtPath, txtStage, txt.get(id)!);
+            else await appendFile(txtStage, formatTxt(message), "utf8");
+            if (html.has(id)) await copySegment(htmlPath, htmlStage, html.get(id)!);
+            else await appendFile(htmlStage, formatHtml(message), "utf8");
         }
         await appendFile(htmlStage, HTML_FOOTER, "utf8");
-        // No final file is truncated or published while the rebuild is incomplete.
+        await prepareRollback(txtPath, htmlPath);
         await rename(txtStage, txtPath);
         await rename(htmlStage, htmlPath);
+        await rm(`${txtPath}.rollback.stage`, { force: true });
+    } catch (error) {
+        await recoverPair(txtPath, htmlPath);
+        throw error;
     } finally {
         await rm(txtStage, { force: true });
         await rm(htmlStage, { force: true });
+        await rm(`${txtPath}.rollback.prepare.stage`, { force: true });
+        if (!await exists(`${txtPath}.rollback.stage`)) {
+            await rm(`${txtPath}.backup.stage`, { force: true });
+            await rm(`${htmlPath}.backup.stage`, { force: true });
+        }
     }
-    await rememberPublished(txtPath, htmlPath, names.length, names[names.length - 1].slice(0, -5));
-    return { directory, txtPath, htmlPath, count: names.length };
+    return { directory, txtPath, htmlPath, count: ordered.length };
 }
 
-async function rememberPublished(txtPath: string, htmlPath: string, count: number, newest: string) {
-    const txt = await stat(txtPath);
-    const html = await stat(htmlPath);
-    published.delete(txtPath);
-    published.set(txtPath, { count, newest, txtSize: txt.size, htmlSize: html.size });
-    // Eviction only loses the ascending fast path: canonical records remain the
-    // source of truth and a future write rebuilds the evicted day.
-    while (published.size > 5000) published.delete(published.keys().next().value!);
+async function exists(path: string) {
+    try { await stat(path); return true; }
+    catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+    }
+}
+
+async function prepareRollback(txtPath: string, htmlPath: string) {
+    const hadPair = await exists(txtPath);
+    if (hadPair !== await exists(htmlPath)) throw new Error("Incomplete live archive pair");
+    for (const path of [txtPath, htmlPath]) {
+        await rm(`${path}.backup.stage`, { force: true });
+        if (hadPair) await copyFile(path, `${path}.backup.stage`);
+    }
+    // Publish the marker only after both backups are complete.
+    await rm(`${txtPath}.rollback.prepare.stage`, { force: true });
+    await writeFile(`${txtPath}.rollback.prepare.stage`, hadPair ? "pair\n" : "empty\n", "utf8");
+    await rename(`${txtPath}.rollback.prepare.stage`, `${txtPath}.rollback.stage`);
+}
+
+async function recoverPair(txtPath: string, htmlPath: string) {
+    const marker = `${txtPath}.rollback.stage`;
+    if (!await exists(marker)) return;
+    const file = await open(marker, "r");
+    const buffer = Buffer.alloc(16);
+    let state: string;
+    try {
+        const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+        state = buffer.subarray(0, bytesRead).toString("utf8");
+    } finally { await file.close(); }
+    if (state !== "pair\n" && state !== "empty\n") throw new Error("Invalid live rollback marker");
+    // Keep backups and marker until BOTH restorations complete. A crash in
+    // this loop can therefore be retried without consuming either backup.
+    for (const path of [txtPath, htmlPath]) {
+        if (state === "pair\n") await copyFile(`${path}.backup.stage`, path);
+        else await rm(path, { force: true });
+    }
+    await rm(marker, { force: true });
+    for (const path of [txtPath, htmlPath]) await rm(`${path}.backup.stage`, { force: true });
 }

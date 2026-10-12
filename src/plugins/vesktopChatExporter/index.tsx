@@ -219,6 +219,38 @@ type RawMessage = {
 type Container = { category?: string; id: string; name: string; channels: MessageTarget[]; discover?: boolean; };
 
 type ExportChannel = { channel: MessageTarget; messages: RawMessage[]; error?: string; };
+type ExportStatus = {
+    phase: "idle" | "fetching" | "assembling" | "publishing" | "complete" | "incomplete" | "cancelled" | "failed" | "paused";
+    completedChannels: number; totalChannels: number; fetchedMessages: number;
+    processedPages: number; totalPages: number;
+};
+let statusPanel: HTMLElement | undefined;
+function renderExportStatus(status: ExportStatus) {
+    // The isolated harness and early Discord startup may not have a DOM yet.
+    if (typeof document === "undefined" || !document.body) return;
+    if (!statusPanel) {
+        statusPanel = document.createElement("div");
+        statusPanel.id = "vc-chat-export-status";
+        statusPanel.setAttribute("role", "status");
+        statusPanel.setAttribute("aria-live", "polite");
+        Object.assign(statusPanel.style, {
+            position: "fixed", bottom: "16px", right: "16px", zIndex: "1000",
+            padding: "12px 16px", borderRadius: "8px", background: "var(--background-secondary, #232428)",
+            color: "var(--text-normal, #fff)", fontSize: "13px", pointerEvents: "none",
+            boxShadow: "0 2px 10px #0006", whiteSpace: "pre-line"
+        });
+        document.body.appendChild(statusPanel);
+    }
+    // 100% is reserved for a successfully published, fully complete export.
+    const percent = status.phase === "complete" ? 100
+        : status.totalPages ? Math.min(99, Math.floor(status.processedPages * 100 / status.totalPages)) : 0;
+    const phases: Record<ExportStatus["phase"], string> = {
+        idle: "待機", fetching: "取得中", assembling: "組み立て中", publishing: "公開処理中",
+        complete: "完了", incomplete: "不完全", cancelled: "中止", failed: "失敗", paused: "一時停止"
+    };
+    Object.assign(statusPanel.dataset, status, { percent });
+    statusPanel.textContent = `チャット保存: ${phases[status.phase]}\n取得: ${status.completedChannels}/${status.totalChannels} チャンネル・${status.fetchedMessages} メッセージ\n組み立て: ${status.processedPages}/${status.totalPages} ページ (${percent}%)`;
+}
 let exporting = false;
 let cancelled = false;
 let subscribed = false;
@@ -678,6 +710,15 @@ async function exportChannels(container: Container, label: string) {
     const pendingPurges = new Set<string>();
     let manifest: { tool: string; version: number; started: string; target: string; targetId: string; discovered: number; };
     let fetched = 0, revoked = 0;
+    const status: ExportStatus = { phase: "fetching", completedChannels: 0, totalChannels: 0,
+        fetchedMessages: 0, processedPages: 0, totalPages: 0 };
+    const updateStatus = (phase: ExportStatus["phase"] = status.phase) => {
+        status.phase = phase;
+        status.completedChannels = progress.filter(entry => entry.completed).length;
+        status.fetchedMessages = progress.reduce((sum, entry) => sum + entry.messages, 0);
+        renderExportStatus(status);
+    };
+    updateStatus();
     const checkpoint = async (phase: string, outcome = "running") => {
         if (base) await Native.checkpointExport(container.category, base, JSON.stringify({ ...manifest, phase, outcome, fetched, revoked, progress }));
     };
@@ -716,6 +757,8 @@ async function exportChannels(container: Container, label: string) {
         const discovery = container.discover ? await collectGuildTargets(container.id, () => !cancelled, () => true)
             : { channels: container.channels.filter(channel => !isTargetBlocked(channel) && canReadTarget(channel)), issues: [] };
         const { channels, issues } = discovery;
+        status.totalChannels = channels.length;
+        updateStatus();
         if (cancelled || pluginStopped || authFailed) return;
         if (!channels.length) {
             if (pending && !progress.length) await Native.discardExport(container.category, base);
@@ -809,9 +852,11 @@ async function exportChannels(container: Container, label: string) {
                     entry.before = page[0].id;
                     entry.completed = page.length < 100;
                     fetched += page.length;
+                    updateStatus();
                     await checkpoint("fetching");
                     if (fetched % 500 === 0) showToast(`${name}: 累計${fetched}件保存`, Toasts.Type.MESSAGE);
                 }, entry.before);
+                updateStatus();
                 await checkpoint("fetching");
             } catch (error) {
                 // Access revoked while this channel was being walked: discard this run's pages for it
@@ -862,6 +907,9 @@ async function exportChannels(container: Container, label: string) {
         // Each permission retry removes a channel; cancellation adds at most one further retry.
         assembly: for (let attempt = 0; attempt <= walked.length + 1; attempt++) {
             total = 0; savedChannels = 0;
+            status.processedPages = 0;
+            status.totalPages = surviving.reduce((sum, entry) => sum + entry.pages.length, 0);
+            updateStatus("assembling");
             if (attempt) await checkpoint("assembling");
             if (await dropRevoked()) continue;
             const savedList = surviving.map(entry => entry.channel);
@@ -892,6 +940,8 @@ async function exportChannels(container: Container, label: string) {
                     if (await dropRevoked()) continue assembly;
                     total += stored.length;
                     assembled += stored.length;
+                    status.processedPages++;
+                    updateStatus();
                 }
                 if (assembled !== entry.messages) throw new Error("保存済み件数が一致しません");
                 await Native.appendExport(container.category, base, { html: "</section>" });
@@ -923,6 +973,7 @@ async function exportChannels(container: Container, label: string) {
             }
             const incomplete = notice.length > 0 || savedChannels !== channels.length;
             const finalCancelled = cancelled;
+            updateStatus("publishing");
             const saved = await Native.finishExport(
                 container.category,
                 base,
@@ -943,6 +994,7 @@ async function exportChannels(container: Container, label: string) {
                 await Native.abortExportFiles(container.category, base);
                 continue;
             }
+            updateStatus(cancelled ? "cancelled" : incomplete ? "incomplete" : "complete");
             if (cancelled)
                 return showToast(`エクスポートを中止しました（保存済み: ${total}件 / ${opened.directory}）`, Toasts.Type.FAILURE);
             return showToast(`${incomplete ? "一部のみ保存（不完全）" : "完了"}: ${total}件 / ${saved.directory}`, incomplete ? Toasts.Type.FAILURE : Toasts.Type.SUCCESS);
@@ -951,6 +1003,7 @@ async function exportChannels(container: Container, label: string) {
         await Native.discardExport(container.category, base);
         throw new Error("保存中に閲覧権限が変わり続けたため中止しました");
     } catch (error) {
+        updateStatus("failed");
         if (base) {
             try { await scrubProgress(); } catch { /* Still attempt both independent cleanup and checkpoint writes. */ }
             try { await Native.abortExportFiles(container.category, base); } catch { /* Failed cleanup is not a complete export. */ }
@@ -958,6 +1011,8 @@ async function exportChannels(container: Container, label: string) {
         }
         showToast(`ログ保存に失敗 (HTTP ${statusOf(error) ?? "unknown"})`, Toasts.Type.FAILURE);
     } finally {
+        if (status.phase !== "failed" && status.phase !== "complete" && status.phase !== "incomplete" && status.phase !== "cancelled")
+            updateStatus(cancelled ? "cancelled" : pluginStopped || authFailed ? "paused" : "incomplete");
         exporting = false;
     }
 }
