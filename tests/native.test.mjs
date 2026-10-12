@@ -60,7 +60,7 @@ test("new content JSON and old JSONL pages can resume together without duplicate
     } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
-test("history chunks are stored oldest-first so the archive reads chronologically", async () => {
+test("history chunks retain newest_oldest names while their bodies read oldest-first", async () => {
     const scratch = process.env.TMPDIR;
     assert.ok(scratch, "TMPDIR must point to the test scratch directory");
     const dir = await mkdtemp(path.join(scratch, "vesktop-order-test-"));
@@ -78,7 +78,8 @@ test("history chunks are stored oldest-first so the archive reads chronologicall
         const page = [entry(12), entry(11), entry(10)];
         const history = await native.saveHistoryPage(null, undefined, id(3), "Fixture", id(5), "chrono", page);
 
-        const base = `${id(10)}_${id(12)}`;
+        const base = `${id(12)}_${id(10)}`;
+        assert.equal(history.directory, path.join(dir, "VesktopChatLogs", `Fixture_${id(3)}`, "History", `chrono_${id(5)}`));
         assert.deepEqual((await readdir(history.directory)).sort(), [`${base}.html`, `${base}.txt`]);
         assert.equal(history.oldest, id(10));
         assert.equal(history.newest, id(12));

@@ -101,14 +101,12 @@ export async function saveHistoryPage(
     const directory = join(rootDir(category), `${safeFileName(guildName)}_${guildId}`, "History", `${safeFileName(channelName)}_${channelId}`);
     await mkdir(directory, { recursive: true });
 
-    // Nothing may be dropped, the archive must read oldest -> newest: Discord pages
-    // arrive newest -> oldest, so sort them back into chronological order and name the
-    // chunk by its oldest snowflake first. A re-fetch of the same page overwrites the
-    // same two files instead of duplicating the archive.
+    // Keep the original newest_oldest filename contract, independently of the
+    // oldest -> newest body order. Re-fetching the same page overwrites the same files.
     const ordered = [...messages].sort(compareChronologically);
     const oldest = ordered[0].messageId;
     const newest = ordered[ordered.length - 1].messageId;
-    const base = `${oldest}_${newest}`;
+    const base = `${newest}_${oldest}`;
     const txt = ordered.map(message => {
         const links = message.attachments.map(a => `[添付] ${a.filename}: ${a.url}`).join("\n");
         return `[${message.timestamp}] ${message.author} (${message.authorId}) [${message.messageId}]\n${message.content}${links ? `\n${links}` : ""}`;

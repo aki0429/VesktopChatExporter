@@ -53,7 +53,25 @@ test("new live archives persist only TXT and HTML, never JSON or another canonic
     const archive = loadArchive(root);
     await archive.writeLiveArchive(root, message(22));
     const result = await archive.writeLiveArchive(root, message(21));
-    assert.deepEqual((await fs.readdir(result.directory)).sort(), ["2026-01-01.html", "2026-01-01.txt"]);
+    assert.deepEqual((await fs.readdir(result.directory)).sort(), [`2026-01-01_chrono_${id(5)}.html`, `2026-01-01_chrono_${id(5)}.txt`]);
+    assert.equal(result.directory, path.join(root, "VesktopChatLogs", `Fixture_${id(3)}`));
+}));
+
+test("live paths retain original category, sanitized names, 180-character limit and UTC day", () => fixture(async root => {
+    const archive = loadArchive(root);
+    for (const [category, guildName, channelName, safeCategory, safeGuild, safeChannel] of [
+        ['DMs:.. ', 'Guild/Name.. ', 'chat?room. ', 'DMs_', 'Guild_Name', 'chat_room'],
+        ['... ', '... ', '... ', 'chat-export', 'chat-export', 'chat-export'],
+        [undefined, 'G'.repeat(181), 'C'.repeat(181), undefined, 'G'.repeat(180), 'C'.repeat(180)]
+    ]) {
+        const result = await archive.writeLiveArchive(root, message(21, {
+            category, guildName, channelName, timestamp: '2026-01-02T00:30:00+09:00'
+        }));
+        const directory = path.join(root, 'VesktopChatLogs', ...(safeCategory ? [safeCategory] : []), `${safeGuild}_${id(3)}`);
+        assert.equal(result.directory, directory);
+        assert.equal(result.txtPath, path.join(directory, `2026-01-01_${safeChannel}_${id(5)}.txt`));
+        assert.equal(result.htmlPath, path.join(directory, `2026-01-01_${safeChannel}_${id(5)}.html`));
+    }
 }));
 
 test("TXT body header lookalikes never become archive IDs", () => fixture(async root => {
@@ -85,10 +103,10 @@ test("reloading with the same live payload never publishes a second copy", () =>
     assert.deepEqual((await rows(result)).txt, [21]);
 }));
 
-test("reload preserves first payload and stable ID paths", () => fixture(async root => {
+test("reload preserves first payload at the original name-based path", () => fixture(async root => {
     const first = await loadArchive(root).writeLiveArchive(root, message(21));
     const again = await loadArchive(root).writeLiveArchive(root, message(21, {
-        guildName: "renamed", channelName: "renamed", content: "replacement must not win"
+        content: "replacement must not win"
     }));
     assert.equal(again.txtPath, first.txtPath);
     assert.equal(again.count, 1);
@@ -116,7 +134,7 @@ test("partial TXT stage writes stay nonfinal and the same ID is retryable", () =
         }
     });
     await assert.rejects(() => archive.writeLiveArchive(root, message(21)), /synthetic interrupted TXT write/);
-    const directory = path.join(root, "VesktopChatLogs", "Live", id(3), id(5));
+    const directory = path.join(root, "VesktopChatLogs", `Fixture_${id(3)}`);
     assert.deepEqual(await fs.readdir(directory), []);
     const result = await archive.writeLiveArchive(root, message(21));
     assert.deepEqual((await rows(result)).txt, [21]);
@@ -164,7 +182,7 @@ test("different ID proceeds after second pair rename fails", () => fixture(async
     assert.deepEqual((await rows(result)).html, [id(22), id(23)]);
     assert.deepEqual((await fs.readFile(result.txtPath)).subarray(0, txtBefore.length), txtBefore);
     assert.ok((await fs.readFile(result.htmlPath)).includes(htmlBefore.subarray(0, htmlBefore.length - 14)));
-    assert.deepEqual((await fs.readdir(result.directory)).sort(), ["2026-01-01.html", "2026-01-01.txt"]);
+    assert.deepEqual((await fs.readdir(result.directory)).sort(), [`2026-01-01_chrono_${id(5)}.html`, `2026-01-01_chrono_${id(5)}.txt`]);
 }));
 
 test("multiline author is refused before touching files and cannot poison later saves", () => fixture(async root => {
@@ -227,7 +245,7 @@ test("restart rolls back crash snapshots before accepting a different ID", () =>
             assert.deepEqual((await fs.readFile(result.txtPath)).subarray(0, txtBefore.length), txtBefore);
             assert.ok((await fs.readFile(result.htmlPath)).includes(htmlBefore.subarray(0, htmlBefore.length - 14)));
         }
-        assert.deepEqual((await fs.readdir(result.directory)).sort(), ["2026-01-01.html", "2026-01-01.txt"]);
+        assert.deepEqual((await fs.readdir(result.directory)).sort(), [`2026-01-01_chrono_${id(5)}.html`, `2026-01-01_chrono_${id(5)}.txt`]);
         await fs.rm(result.directory, { recursive: true });
     }
 }));
@@ -255,7 +273,7 @@ test("failed rollback preserves backups for the next different ID", () => fixtur
     const first = await archive.writeLiveArchive(root, message(22));
     failRename = true;
     await assert.rejects(() => archive.writeLiveArchive(root, message(21)), /synthetic restore EIO/);
-    assert.ok((await fs.readdir(first.directory)).includes("2026-01-01.txt.rollback.stage"));
+    assert.ok((await fs.readdir(first.directory)).includes(`2026-01-01_chrono_${id(5)}.txt.rollback.stage`));
     const result = await loadArchive(root).writeLiveArchive(root, message(23));
     assert.deepEqual((await rows(result)).txt, [22, 23]);
     assert.deepEqual((await rows(result)).html, [id(22), id(23)]);
@@ -285,10 +303,10 @@ test("ascending HTML append failure rolls back before accepting another ID", () 
     assert.deepEqual((await rows(result)).html, [id(21), id(23)]);
 }));
 
-test("legacy daily files are never read, reordered or written", () => fixture(async root => {
-    const legacy = path.join(root, "VesktopChatLogs", `Fixture_${id(3)}`);
+test("the unsolicited Live ID namespace is never read, renamed or migrated", () => fixture(async root => {
+    const legacy = path.join(root, "VesktopChatLogs", "Live", id(3), id(5));
     await fs.mkdir(legacy, { recursive: true });
-    const files = [path.join(legacy, `2026-01-01_chrono_${id(5)}.txt`), path.join(legacy, `2026-01-01_chrono_${id(5)}.html`)];
+    const files = [path.join(legacy, "2026-01-01.txt"), path.join(legacy, "2026-01-01.html")];
     for (const file of files) await fs.writeFile(file, "row 22\nrow 21\n", "utf8");
     const archive = loadArchive(root, {
         readFile: async (file, ...args) => {
@@ -297,7 +315,7 @@ test("legacy daily files are never read, reordered or written", () => fixture(as
         }
     });
     const result = await archive.writeLiveArchive(root, message(23));
-    assert.ok(result.directory.includes(`${path.sep}Live${path.sep}`));
+    assert.equal(result.directory, path.join(root, "VesktopChatLogs", `Fixture_${id(3)}`));
     for (const file of files) assert.equal(await fs.readFile(file, "utf8"), "row 22\nrow 21\n");
 }));
 
@@ -326,7 +344,8 @@ test("day and channel keys isolate independent archives", () => fixture(async ro
     const otherChannel = await archive.writeLiveArchive(root, message(21, { channelId: id(6), category: "DMs" }));
     const tomorrow = await archive.writeLiveArchive(root, message(21, { timestamp: "2026-01-02T00:00:00.000Z" }));
     assert.notEqual(today.directory, otherChannel.directory);
-    assert.ok(otherChannel.directory.includes(`${path.sep}DMs${path.sep}`), "DM isolation survives the new live namespace");
+    assert.equal(otherChannel.directory, path.join(root, "VesktopChatLogs", "DMs", `Fixture_${id(3)}`));
+    assert.equal(otherChannel.txtPath, path.join(otherChannel.directory, `2026-01-01_chrono_${id(6)}.txt`));
     assert.notEqual(today.txtPath, tomorrow.txtPath);
     for (const result of [today, otherChannel, tomorrow]) {
         assert.equal(result.count, 1);

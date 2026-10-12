@@ -58,12 +58,17 @@ function recordDay(message: LiveRecord) {
     return date.toISOString().slice(0, 10);
 }
 
+function safeFileName(value: string) {
+    return value.replace(/[\\/:*?"<>|]/g, "_").replace(/[. ]+$/g, "").slice(0, 180) || "chat-export";
+}
+
 export async function writeLiveArchive(documentsRoot: string, message: LiveRecord) {
     const day = recordDay(message);
-    const category = message.category?.replace(/[\\/:*?"<>|]/g, "_").replace(/[. ]+$/g, "").slice(0, 180);
-    const directory = join(documentsRoot, "VesktopChatLogs", ...(category ? [category] : []), "Live", message.guildId, message.channelId);
-    const txtPath = join(directory, `${day}.txt`);
-    const htmlPath = join(directory, `${day}.html`);
+    const category = message.category ? safeFileName(message.category) : undefined;
+    const directory = join(documentsRoot, "VesktopChatLogs", ...(category ? [category] : []), `${safeFileName(message.guildName)}_${message.guildId}`);
+    const base = `${day}_${safeFileName(message.channelName)}_${message.channelId}`;
+    const txtPath = join(directory, `${base}.txt`);
+    const htmlPath = join(directory, `${base}.html`);
     const operation = (queues.get(txtPath) ?? Promise.resolve()).then(() => writeArchive(directory, txtPath, htmlPath, message));
     const tail = operation.then(() => {}, () => {});
     queues.set(txtPath, tail);
